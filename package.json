@@ -1,0 +1,15 @@
+{
+  "name": "tups-thailand-payment-server",
+  "version": "1.0.0",
+  "description": "Example Omise charge server for LYVON x TUPS Thailand checkout",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "omise": "^1.5.0"
+  }
+}
