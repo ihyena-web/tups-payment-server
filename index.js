@@ -166,7 +166,8 @@ app.post('/promptpay-charge', async (req, res) => {
 // The frontend polls this every few seconds after showing the QR.
 // Only when this reports paid=true / status="successful" should the
 // site tell the customer their order is confirmed and notify LINE —
-// this is what guarantees the FULL, EXACT amount actually arrived.
+// this is what guarantees the FULL, EXACT amount actually arrived,
+// solving "손님이 얼마를 낼지 우리가 일일이 확인해야 하냐"問題.
 // ------------------------------------------------------------
 app.get('/charge-status/:id', async (req, res) => {
   try {
