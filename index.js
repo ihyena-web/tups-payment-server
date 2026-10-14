@@ -8,15 +8,18 @@
 // VPS, etc.) — it cannot run from a static file host.
 //
 // Endpoints:
-//   POST /charge                 — card payments (existing, unchanged)
-//   POST /promptpay-charge       — NEW: creates a PromptPay source + charge
-//                                   for the EXACT order amount, and returns
-//                                   the QR code image (embedded as base64)
-//   GET  /charge-status/:id      — NEW: poll this until status is
-//                                   "successful" (paid=true) to confirm the
-//                                   exact amount was actually received
-//                                   before telling the customer their order
-//                                   is confirmed
+//   POST /charge                 — card payments. Handles 3-D Secure: if the
+//                                   card issuer requires it, returns
+//                                   { pending: true, authorizeUri } instead of
+//                                   an immediate success/fail — the frontend
+//                                   must redirect the browser to authorizeUri.
+//   POST /promptpay-charge       — creates a PromptPay source + charge for the
+//                                   EXACT order amount, and returns the QR
+//                                   code image (embedded as base64)
+//   GET  /charge-status/:id      — poll this until status is "successful"
+//                                   (paid=true) to confirm the exact amount
+//                                   was actually received before telling the
+//                                   customer their order is confirmed
 // ============================================================
 
 require('dotenv').config();
@@ -32,12 +35,17 @@ const app = express();
 app.use(cors());          // restrict this to your real site domain in production
 app.use(express.json());
 
+// Fallback return_uri for 3-D Secure if the frontend doesn't send one —
+// Omise redirects the customer's browser here after they complete their
+// bank's verification step.
+const DEFAULT_RETURN_URI = 'https://lyvonthai.com/checkout.html';
+
 // ------------------------------------------------------------
-// POST /charge  (existing — card payments)
-// body: { omiseToken, amount, currency, customer: { name, phone, address } }
+// POST /charge  (card payments)
+// body: { omiseToken, amount, currency, customer: { name, phone, address }, returnUri }
 // ------------------------------------------------------------
 app.post('/charge', async (req, res) => {
-  const { omiseToken, amount, currency, customer } = req.body;
+  const { omiseToken, amount, currency, customer, returnUri } = req.body;
 
   if (!omiseToken || !amount || !currency) {
     return res.status(400).json({ success: false, message: 'Missing required fields' });
@@ -48,6 +56,7 @@ app.post('/charge', async (req, res) => {
       amount,                 // amount in satang (THB x 100)
       currency,                // "thb"
       card: omiseToken,        // token or source id from Omise.js on the frontend
+      return_uri: returnUri || DEFAULT_RETURN_URI, // required whenever 3-D Secure is triggered
       description: `TUPS Thailand order — ${customer?.name || 'customer'}`,
       metadata: {
         customer_name: customer?.name || '',
@@ -62,6 +71,19 @@ app.post('/charge', async (req, res) => {
       return res.json({ success: true, chargeId: charge.id });
     }
 
+    if (charge.status === 'pending' && charge.authorize_uri) {
+      // 3-D Secure (or another authorize-type step) is required. The frontend
+      // must redirect the customer's whole browser to authorize_uri; Omise
+      // will send them back to return_uri once they finish verifying with
+      // their bank, at which point /charge-status/:id tells us the outcome.
+      return res.json({
+        success: true,
+        pending: true,
+        chargeId: charge.id,
+        authorizeUri: charge.authorize_uri,
+      });
+    }
+
     return res.status(402).json({
       success: false,
       message: charge.failure_message || 'Payment was not successful',
@@ -73,7 +95,7 @@ app.post('/charge', async (req, res) => {
 });
 
 // ------------------------------------------------------------
-// POST /promptpay-charge  (NEW)
+// POST /promptpay-charge
 //
 // This is the fix for "손님이 담은 금액만큼 딱 결제를 청구해야 한다":
 // instead of a static QR where the customer types in whatever amount
@@ -161,12 +183,13 @@ app.post('/promptpay-charge', async (req, res) => {
 });
 
 // ------------------------------------------------------------
-// GET /charge-status/:id  (NEW)
+// GET /charge-status/:id
 //
-// The frontend polls this every few seconds after showing the QR.
-// Only when this reports paid=true / status="successful" should the
-// site tell the customer their order is confirmed and notify LINE —
-// this is what guarantees the FULL, EXACT amount actually arrived.
+// The frontend polls this every few seconds after showing the QR, or after
+// the customer returns from a 3-D Secure redirect. Only when this reports
+// paid=true / status="successful" should the site tell the customer their
+// order is confirmed and notify LINE — this is what guarantees the FULL,
+// EXACT amount actually arrived.
 // ------------------------------------------------------------
 app.get('/charge-status/:id', async (req, res) => {
   try {
