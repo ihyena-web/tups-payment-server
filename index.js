@@ -22,8 +22,11 @@
 //                                   was actually received before telling the
 //                                   customer their order is confirmed
 //   POST /signup                 — create a member account (password is
-//                                   hashed before it's ever stored)
+//                                   hashed before it's ever stored). Also
+//                                   grants 3 welcome coupons automatically.
 //   POST /login                  — verify a member's email + password
+//   GET  /my-coupons             — a logged-in member's own coupons (used +
+//                                   unused), shown at checkout
 //   GET  /my-orders               — a logged-in member's own order history
 //   POST /my-orders/:chargeId/cancel — customer self-cancels + refunds their
 //                                   own order (only before it has shipped)
@@ -125,6 +128,8 @@ async function saveOrderFromCharge(charge) {
     let items = [];
     try { items = JSON.parse(charge?.metadata?.items_json || '[]'); } catch (e) { items = []; }
     const paymentMethod = charge?.card ? 'card' : (charge?.source && charge.source.type) || 'unknown';
+    const discountAmount = Number(charge?.metadata?.discount_satang) || 0;
+    const couponId = charge?.metadata?.coupon_id || null;
     const row = {
       charge_id: charge.id,
       order_number: makeOrderNumber(charge.id, charge.created_at),
@@ -135,6 +140,8 @@ async function saveOrderFromCharge(charge) {
       member_email: (charge?.metadata?.member_email || '').toLowerCase() || null,
       items,
       amount: charge.amount,
+      discount_amount: discountAmount,
+      coupon_id: couponId,
       currency: charge.currency,
       payment_method: paymentMethod,
       status: charge.status,
@@ -152,8 +159,87 @@ async function saveOrderFromCharge(charge) {
     if (!res.ok) {
       console.error('Supabase order save failed:', res.status, await res.text());
     }
+
+    // A coupon only actually gets "spent" once the payment is truly
+    // successful — never for a charge that's merely pending/failed/expired,
+    // since saveOrderFromCharge() gets called at every stage of a charge's
+    // life (creation, 3DS return, PromptPay poll) and we don't want a coupon
+    // burned on an attempt that never actually completed.
+    if (couponId && charge.status === 'successful') {
+      await markCouponUsed(couponId, charge, discountAmount);
+    }
   } catch (err) {
     console.error('Supabase order save error:', err);
+  }
+}
+
+// ------------------------------------------------------------
+// Welcome coupons — issued automatically the moment someone signs up, to
+// give them a reason to create an account instead of checking out as a
+// guest. Three fixed tiers; the thresholds/discounts live here in one
+// place so they're easy to tweak later without touching anything else.
+// All amounts below are in THB (not satang) — converted to satang only
+// where that matters (Omise charges / the min-spend check at checkout).
+// ------------------------------------------------------------
+const WELCOME_COUPON_TIERS = [
+  { tier: 'tier1', min_spend: 1000, discount_amount: 100 },
+  { tier: 'tier2', min_spend: 2000, discount_amount: 300 },
+  { tier: 'tier3', min_spend: 3000, discount_amount: 600 },
+];
+
+async function issueWelcomeCoupons(email) {
+  try {
+    const rows = WELCOME_COUPON_TIERS.map(t => ({
+      member_email: email,
+      tier: t.tier,
+      min_spend: t.min_spend,
+      discount_amount: t.discount_amount,
+      used: false,
+    }));
+    const res = await supabaseRequest('coupons', {
+      method: 'POST',
+      headers: { Prefer: 'return=minimal' },
+      body: JSON.stringify(rows),
+    });
+    if (!res.ok) {
+      console.error('Welcome coupon issue failed:', res.status, await res.text());
+    }
+  } catch (err) {
+    console.error('Welcome coupon issue error:', err);
+  }
+}
+
+// Marks one coupon as spent once its order has actually succeeded. Re-checks
+// the coupon is still real, still unused, and belongs to the same member the
+// order is attached to before touching it — this is a sanity check, not a
+// hardened guarantee (the discount itself is computed on the frontend, same
+// trust model as the rest of this lightweight server), so it just makes sure
+// a coupon can't silently get marked used twice or credited to the wrong
+// order.
+async function markCouponUsed(couponId, charge, discountAmount) {
+  try {
+    const memberEmail = (charge?.metadata?.member_email || '').toLowerCase();
+    if (!memberEmail) return;
+    const getRes = await supabaseRequest(`coupons?id=eq.${encodeURIComponent(couponId)}&select=*`);
+    if (!getRes.ok) return;
+    const rows = await getRes.json();
+    const coupon = rows && rows[0];
+    if (!coupon || coupon.used) return;
+    if (String(coupon.member_email || '').toLowerCase() !== memberEmail) return;
+
+    const subtotalSatang = Number(charge?.metadata?.subtotal_satang) || (charge.amount + discountAmount);
+    if (subtotalSatang < coupon.min_spend * 100) return; // threshold not actually met — skip, don't burn the coupon
+
+    const patchRes = await supabaseRequest(`coupons?id=eq.${encodeURIComponent(couponId)}`, {
+      method: 'PATCH',
+      headers: { Prefer: 'return=minimal' },
+      body: JSON.stringify({ used: true, used_at: new Date().toISOString(), order_charge_id: charge.id }),
+    });
+    if (!patchRes.ok) {
+      console.error('Coupon mark-used failed:', patchRes.status, await patchRes.text());
+    }
+  } catch (err) {
+    console.error('Coupon mark-used error:', err);
   }
 }
 
@@ -162,7 +248,7 @@ async function saveOrderFromCharge(charge) {
 // body: { omiseToken, amount, currency, customer: { name, phone, address }, items, returnUri, memberEmail }
 // ------------------------------------------------------------
 app.post('/charge', async (req, res) => {
-  const { omiseToken, amount, currency, customer, items, returnUri, memberEmail } = req.body;
+  const { omiseToken, amount, currency, customer, items, returnUri, memberEmail, couponId, subtotalSatang, discountSatang } = req.body;
 
   if (!omiseToken || !amount || !currency) {
     return res.status(400).json({ success: false, message: 'Missing required fields' });
@@ -170,7 +256,7 @@ app.post('/charge', async (req, res) => {
 
   try {
     const charge = await omise.charges.create({
-      amount,                 // amount in satang (THB x 100)
+      amount,                 // amount in satang (THB x 100) — already has any coupon discount subtracted
       currency,                // "thb"
       card: omiseToken,        // token or source id from Omise.js on the frontend
       return_uri: returnUri || DEFAULT_RETURN_URI, // required whenever 3-D Secure is triggered
@@ -183,6 +269,13 @@ app.post('/charge', async (req, res) => {
         // Only set when the customer was logged in at checkout — lets /my-orders
         // find this order later. Guest checkouts simply have no member_email.
         member_email: memberEmail || '',
+        // Coupon bookkeeping — couponId is only set when the customer actually
+        // clicked a coupon on at checkout. subtotal is the cart total BEFORE the
+        // discount, so saveOrderFromCharge() can re-check the min-spend
+        // threshold was genuinely met before marking the coupon as used.
+        coupon_id: couponId ? String(couponId) : '',
+        subtotal_satang: subtotalSatang || amount,
+        discount_satang: discountSatang || 0,
       },
     });
 
@@ -232,7 +325,7 @@ app.post('/charge', async (req, res) => {
 // response: { success, chargeId, status, qrImageBase64, expiresAt }
 // ------------------------------------------------------------
 app.post('/promptpay-charge', async (req, res) => {
-  const { amount, currency, customer, items, memberEmail } = req.body;
+  const { amount, currency, customer, items, memberEmail, couponId, subtotalSatang, discountSatang } = req.body;
 
   if (!amount || !currency) {
     return res.status(400).json({ success: false, message: 'Missing required fields' });
@@ -264,6 +357,9 @@ app.post('/promptpay-charge', async (req, res) => {
         shipping_address: customer?.address || '',
         items_json: JSON.stringify(items || []),
         member_email: memberEmail || '',
+        coupon_id: couponId ? String(couponId) : '',
+        subtotal_satang: subtotalSatang || amount,
+        discount_satang: discountSatang || 0,
       },
     });
 
@@ -399,6 +495,9 @@ app.post('/signup', async (req, res) => {
     });
 
     if (sbRes.ok) {
+      // Fire-and-forget — a hiccup issuing coupons shouldn't fail the signup
+      // itself, since the account was already created successfully above.
+      issueWelcomeCoupons(row.email);
       return res.json({ success: true });
     }
 
@@ -479,7 +578,7 @@ app.get('/my-orders', async (req, res) => {
   }
   try {
     const sbRes = await supabaseRequest(
-      `orders?member_email=eq.${encodeURIComponent(email)}&select=charge_id,order_number,payment_detail,items,amount,currency,payment_method,status,shipping_status,tracking_number,courier,refund_status,created_at&order=created_at.desc&limit=200`
+      `orders?member_email=eq.${encodeURIComponent(email)}&select=charge_id,order_number,payment_detail,items,amount,discount_amount,coupon_id,currency,payment_method,status,shipping_status,tracking_number,courier,refund_status,created_at&order=created_at.desc&limit=200`
     );
     if (!sbRes.ok) {
       console.error('My-orders fetch failed:', sbRes.status, await sbRes.text());
@@ -489,6 +588,38 @@ app.get('/my-orders', async (req, res) => {
     return res.json({ success: true, orders: data });
   } catch (err) {
     console.error('My-orders fetch error:', err);
+    return res.status(500).json({ success: false, message: 'Server error' });
+  }
+});
+
+// ------------------------------------------------------------
+// GET /my-coupons?email=...
+//
+// Returns one member's welcome coupons (used and unused both — checkout.html
+// uses this to show which of the 3 tiers are still available, and my-orders
+// could show used ones too later). Same lightweight "just trust the stored
+// email" check as /my-orders — no real session/auth here.
+// ------------------------------------------------------------
+app.get('/my-coupons', async (req, res) => {
+  const email = String(req.query.email || '').trim().toLowerCase();
+  if (!email) {
+    return res.status(400).json({ success: false, message: 'Email is required' });
+  }
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
+    return res.status(500).json({ success: false, message: 'Database is not configured yet' });
+  }
+  try {
+    const sbRes = await supabaseRequest(
+      `coupons?member_email=eq.${encodeURIComponent(email)}&select=id,tier,min_spend,discount_amount,used,used_at,order_charge_id,created_at&order=min_spend.asc`
+    );
+    if (!sbRes.ok) {
+      console.error('My-coupons fetch failed:', sbRes.status, await sbRes.text());
+      return res.status(500).json({ success: false, message: 'Server error' });
+    }
+    const data = await sbRes.json();
+    return res.json({ success: true, coupons: data });
+  } catch (err) {
+    console.error('My-coupons fetch error:', err);
     return res.status(500).json({ success: false, message: 'Server error' });
   }
 });
