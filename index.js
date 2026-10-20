@@ -446,7 +446,7 @@ app.get('/my-orders', async (req, res) => {
   }
   try {
     const sbRes = await supabaseRequest(
-      `orders?member_email=eq.${encodeURIComponent(email)}&select=charge_id,items,amount,currency,payment_method,status,shipping_status,tracking_number,courier,created_at&order=created_at.desc&limit=200`
+      `orders?member_email=eq.${encodeURIComponent(email)}&select=charge_id,items,amount,currency,payment_method,status,shipping_status,tracking_number,courier,refund_status,created_at&order=created_at.desc&limit=200`
     );
     if (!sbRes.ok) {
       console.error('My-orders fetch failed:', sbRes.status, await sbRes.text());
@@ -464,13 +464,25 @@ app.get('/my-orders', async (req, res) => {
 // POST /my-orders/:chargeId/cancel
 // body: { email }
 //
-// Lets a customer cancel + refund an order THEY placed, themselves — but
-// only up until an admin has moved it to "shipped" or "delivered" in
-// /admin/orders. Once it's shipped, the package may already be on its way,
-// so the customer needs to contact us directly instead. Same lightweight
-// auth as /my-orders: we just check the email the frontend has stored from
-// /login against the order's member_email — this is not a hardened private
+// Lets a customer cancel an order THEY placed, themselves — but only up
+// until an admin has moved it to "shipped" or "delivered" in /admin/orders.
+// Once it's shipped, the package may already be on its way, so the customer
+// needs to contact us directly instead. Same lightweight auth as
+// /my-orders: we just check the email the frontend has stored from /login
+// against the order's member_email — this is not a hardened private
 // endpoint, same caveat as /my-orders and /login above.
+//
+// IMPORTANT: Omise does NOT support refunding PromptPay charges through
+// their API at all ("PromptPay charges cannot be voided or refunded through
+// Opn Payments") — only card charges can be refunded automatically here.
+// So this branches on payment_method:
+//   - card:      calls Omise's refund API right away -> charge becomes
+//                "reversed" and the customer is refunded automatically.
+//   - promptpay: Omise can't do this for us. We still stop the order going
+//                any further (shipping_status -> "cancelled"), but the
+//                actual money has to be sent back manually (bank transfer)
+//                by us — refund_status is set to "pending_manual" so it
+//                shows up clearly in /admin until someone marks it done.
 // ------------------------------------------------------------
 app.post('/my-orders/:chargeId/cancel', async (req, res) => {
   const chargeId = req.params.chargeId;
@@ -501,25 +513,51 @@ app.post('/my-orders/:chargeId/cancel', async (req, res) => {
     if (order.status !== 'successful') {
       return res.status(400).json({ success: false, message: 'Only paid orders can be cancelled' });
     }
-    const NON_CANCELLABLE_STATUSES = ['shipped', 'delivered'];
-    if (NON_CANCELLABLE_STATUSES.includes(order.shipping_status)) {
+    const NON_CANCELLABLE_SHIPPING = ['shipped', 'delivered', 'cancelled'];
+    if (NON_CANCELLABLE_SHIPPING.includes(order.shipping_status)) {
       return res.status(400).json({
         success: false,
-        message: 'This order has already shipped and can no longer be cancelled here — please contact us directly.',
+        message: order.shipping_status === 'cancelled'
+          ? 'This order has already been cancelled.'
+          : 'This order has already shipped and can no longer be cancelled here — please contact us directly.',
       });
     }
 
-    // Full refund via Omise — this is the part that actually reverses the
-    // card charge / sends the PromptPay payment back.
-    await omise.charges.createRefund(chargeId, { amount: order.amount });
+    if (order.payment_method === 'card') {
+      // Real Omise refund — this is the part that actually reverses the
+      // card charge and returns the money to the customer's card.
+      await omise.charges.createRefund(chargeId, { amount: order.amount });
 
-    // Pull the now-refunded charge back and let the same upsert every other
-    // endpoint uses keep the orders table's status column consistent (it
-    // should come back as "reversed").
-    const charge = await omise.charges.retrieve(chargeId);
-    await saveOrderFromCharge(charge);
+      // Pull the now-refunded charge back and let the same upsert every
+      // other endpoint uses keep the orders table's status column
+      // consistent (it should come back as "reversed").
+      const charge = await omise.charges.retrieve(chargeId);
+      await saveOrderFromCharge(charge);
 
-    return res.json({ success: true, status: charge.status });
+      await supabaseRequest(`orders?charge_id=eq.${encodeURIComponent(chargeId)}`, {
+        method: 'PATCH',
+        headers: { Prefer: 'return=minimal' },
+        body: JSON.stringify({ shipping_status: 'cancelled', refund_status: 'refunded' }),
+      });
+
+      return res.json({ success: true, manual: false, status: charge.status, refund_status: 'refunded' });
+    }
+
+    // Non-card (PromptPay, etc.) — Omise can't refund this for us, so we
+    // only stop fulfillment here and flag it for a manual bank transfer.
+    await supabaseRequest(`orders?charge_id=eq.${encodeURIComponent(chargeId)}`, {
+      method: 'PATCH',
+      headers: { Prefer: 'return=minimal' },
+      body: JSON.stringify({ shipping_status: 'cancelled', refund_status: 'pending_manual' }),
+    });
+
+    return res.json({
+      success: true,
+      manual: true,
+      status: order.status,
+      refund_status: 'pending_manual',
+      message: 'Your cancellation request has been received. Since this order was paid via PromptPay, our team will transfer your refund manually within 1–3 business days.',
+    });
   } catch (err) {
     console.error('Cancel-order error:', err?.message || err);
     return res.status(500).json({
@@ -560,21 +598,31 @@ app.get('/admin/orders', async (req, res) => {
 });
 
 // PATCH /admin/orders/:chargeId
-// body: { shipping_status?, tracking_number?, courier? }
+// body: { shipping_status?, tracking_number?, courier?, refund_status? }
 // Manual way to move an order through order_placed -> preparing -> shipped
 // -> delivered and attach a tracking number, until the Kerry Express API
-// integration is wired up to do this automatically.
+// integration is wired up to do this automatically. "cancelled" is also a
+// valid shipping_status — either the customer self-cancelled via
+// /my-orders/:chargeId/cancel, or an admin sets it here directly.
+// refund_status lets an admin mark a PromptPay order's manual bank refund
+// as done once they've actually sent the money back (see the cancel
+// endpoint above for why PromptPay can't be refunded through Omise).
 app.patch('/admin/orders/:chargeId', async (req, res) => {
   if (!requireAdminKey(req, res)) return;
-  const { shipping_status, tracking_number, courier } = req.body;
-  const ALLOWED_STATUSES = ['order_placed', 'preparing', 'shipped', 'delivered'];
+  const { shipping_status, tracking_number, courier, refund_status } = req.body;
+  const ALLOWED_STATUSES = ['order_placed', 'preparing', 'shipped', 'delivered', 'cancelled'];
   if (shipping_status && !ALLOWED_STATUSES.includes(shipping_status)) {
     return res.status(400).json({ success: false, message: 'Invalid shipping_status' });
+  }
+  const ALLOWED_REFUND_STATUSES = ['none', 'pending_manual', 'refunded'];
+  if (refund_status && !ALLOWED_REFUND_STATUSES.includes(refund_status)) {
+    return res.status(400).json({ success: false, message: 'Invalid refund_status' });
   }
   const patch = {};
   if (shipping_status !== undefined) patch.shipping_status = shipping_status;
   if (tracking_number !== undefined) patch.tracking_number = tracking_number;
   if (courier !== undefined) patch.courier = courier;
+  if (refund_status !== undefined) patch.refund_status = refund_status;
   if (Object.keys(patch).length === 0) {
     return res.status(400).json({ success: false, message: 'Nothing to update' });
   }
