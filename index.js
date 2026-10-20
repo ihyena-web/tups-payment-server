@@ -81,6 +81,37 @@ async function supabaseRequest(path, options = {}) {
   });
 }
 
+// Turns an Omise charge id into a short, friendly order number customers
+// can actually read out loud — e.g. "LY241020-083245" instead of
+// "chrg_69ei52318hwxo95fk5m". Deterministic (same charge id always produces
+// the same order number), so it's safe to recompute on every
+// saveOrderFromCharge() call without it ever changing underneath an order.
+// The real Omise charge id stays the source of truth and is still shown in
+// /admin/orders — customers only ever see this friendly number.
+function makeOrderNumber(chargeId, createdAt) {
+  const date = new Date(createdAt || Date.now());
+  const ymd = isNaN(date.getTime())
+    ? '000000'
+    : date.toISOString().slice(2, 10).replace(/-/g, ''); // YYMMDD
+  let hash = 0;
+  const id = String(chargeId || '');
+  for (let i = 0; i < id.length; i++) {
+    hash = (hash * 31 + id.charCodeAt(i)) % 1000000;
+  }
+  return `LY${ymd}-${String(hash).padStart(6, '0')}`;
+}
+
+// A short, human-readable description of how an order was paid — shown to
+// the customer when they tap their order number on my-orders.html.
+function makePaymentDetail(charge) {
+  if (charge?.card) {
+    const brand = charge.card.brand ? charge.card.brand[0].toUpperCase() + charge.card.brand.slice(1) : 'Card';
+    return charge.card.last_digits ? `${brand} •••• ${charge.card.last_digits}` : brand;
+  }
+  if (charge?.source?.type === 'promptpay') return 'PromptPay';
+  return (charge?.source && charge.source.type) || 'Unknown';
+}
+
 // Writes (or updates, if we've already seen this charge id before) one row
 // into the `orders` table from a live Omise charge object. Safe to call more
 // than once for the same charge (e.g. every time /charge-status is polled) —
@@ -96,6 +127,8 @@ async function saveOrderFromCharge(charge) {
     const paymentMethod = charge?.card ? 'card' : (charge?.source && charge.source.type) || 'unknown';
     const row = {
       charge_id: charge.id,
+      order_number: makeOrderNumber(charge.id, charge.created_at),
+      payment_detail: makePaymentDetail(charge),
       customer_name: charge?.metadata?.customer_name || '',
       customer_phone: charge?.metadata?.customer_phone || '',
       shipping_address: charge?.metadata?.shipping_address || '',
@@ -446,7 +479,7 @@ app.get('/my-orders', async (req, res) => {
   }
   try {
     const sbRes = await supabaseRequest(
-      `orders?member_email=eq.${encodeURIComponent(email)}&select=charge_id,items,amount,currency,payment_method,status,shipping_status,tracking_number,courier,refund_status,created_at&order=created_at.desc&limit=200`
+      `orders?member_email=eq.${encodeURIComponent(email)}&select=charge_id,order_number,payment_detail,items,amount,currency,payment_method,status,shipping_status,tracking_number,courier,refund_status,created_at&order=created_at.desc&limit=200`
     );
     if (!sbRes.ok) {
       console.error('My-orders fetch failed:', sbRes.status, await sbRes.text());
