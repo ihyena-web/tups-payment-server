@@ -25,6 +25,8 @@
 //                                   hashed before it's ever stored)
 //   POST /login                  — verify a member's email + password
 //   GET  /my-orders               — a logged-in member's own order history
+//   POST /my-orders/:chargeId/cancel — customer self-cancels + refunds their
+//                                   own order (only before it has shipped)
 //   GET  /admin/orders           — list all orders (requires x-admin-key header)
 //   GET  /admin/members          — list all signed-up members (requires x-admin-key header)
 //   PATCH /admin/orders/:chargeId — update shipping_status / tracking_number /
@@ -455,6 +457,75 @@ app.get('/my-orders', async (req, res) => {
   } catch (err) {
     console.error('My-orders fetch error:', err);
     return res.status(500).json({ success: false, message: 'Server error' });
+  }
+});
+
+// ------------------------------------------------------------
+// POST /my-orders/:chargeId/cancel
+// body: { email }
+//
+// Lets a customer cancel + refund an order THEY placed, themselves — but
+// only up until an admin has moved it to "shipped" or "delivered" in
+// /admin/orders. Once it's shipped, the package may already be on its way,
+// so the customer needs to contact us directly instead. Same lightweight
+// auth as /my-orders: we just check the email the frontend has stored from
+// /login against the order's member_email — this is not a hardened private
+// endpoint, same caveat as /my-orders and /login above.
+// ------------------------------------------------------------
+app.post('/my-orders/:chargeId/cancel', async (req, res) => {
+  const chargeId = req.params.chargeId;
+  const email = String(req.body.email || '').trim().toLowerCase();
+
+  if (!email) {
+    return res.status(400).json({ success: false, message: 'Email is required' });
+  }
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
+    return res.status(500).json({ success: false, message: 'Database is not configured yet' });
+  }
+
+  try {
+    const sbRes = await supabaseRequest(`orders?charge_id=eq.${encodeURIComponent(chargeId)}&select=*`);
+    if (!sbRes.ok) {
+      console.error('Cancel-order lookup failed:', sbRes.status, await sbRes.text());
+      return res.status(500).json({ success: false, message: 'Server error' });
+    }
+    const rows = await sbRes.json();
+    const order = rows[0];
+
+    if (!order) {
+      return res.status(404).json({ success: false, message: 'Order not found' });
+    }
+    if ((order.member_email || '').toLowerCase() !== email) {
+      return res.status(403).json({ success: false, message: 'You can only cancel your own orders' });
+    }
+    if (order.status !== 'successful') {
+      return res.status(400).json({ success: false, message: 'Only paid orders can be cancelled' });
+    }
+    const NON_CANCELLABLE_STATUSES = ['shipped', 'delivered'];
+    if (NON_CANCELLABLE_STATUSES.includes(order.shipping_status)) {
+      return res.status(400).json({
+        success: false,
+        message: 'This order has already shipped and can no longer be cancelled here — please contact us directly.',
+      });
+    }
+
+    // Full refund via Omise — this is the part that actually reverses the
+    // card charge / sends the PromptPay payment back.
+    await omise.charges.createRefund(chargeId, { amount: order.amount });
+
+    // Pull the now-refunded charge back and let the same upsert every other
+    // endpoint uses keep the orders table's status column consistent (it
+    // should come back as "reversed").
+    const charge = await omise.charges.retrieve(chargeId);
+    await saveOrderFromCharge(charge);
+
+    return res.json({ success: true, status: charge.status });
+  } catch (err) {
+    console.error('Cancel-order error:', err?.message || err);
+    return res.status(500).json({
+      success: false,
+      message: err?.message || 'Server error while cancelling this order',
+    });
   }
 });
 
