@@ -1,8 +1,9 @@
 // ============================================================
-// LYVON x TUPS Thailand — Omise charge server
+// LYVON x TUPS Thailand — Omise charge server + order database
 //
-// This is the ONLY place your Omise Secret Key should ever live.
-// Never put the secret key in checkout.html or any browser code.
+// This is the ONLY place your Omise Secret Key and Supabase keys
+// should ever live. Never put secret keys in checkout.html,
+// signup.html, admin.html, or any browser code.
 //
 // Deploy this on a real server (Render, Railway, Fly.io, your own
 // VPS, etc.) — it cannot run from a static file host.
@@ -20,11 +21,16 @@
 //                                   (paid=true) to confirm the exact amount
 //                                   was actually received before telling the
 //                                   customer their order is confirmed
+//   POST /signup                 — create a member account (password is
+//                                   hashed before it's ever stored)
+//   GET  /admin/orders           — list all orders (requires x-admin-key header)
+//   GET  /admin/members          — list all signed-up members (requires x-admin-key header)
 // ============================================================
 
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
+const crypto = require('crypto');
 const omise = require('omise')({
   publicKey: process.env.OMISE_PUBLIC_KEY,
   secretKey: process.env.OMISE_SECRET_KEY, // skey_test_... or skey_live_...  — from .env only
@@ -41,11 +47,77 @@ app.use(express.json());
 const DEFAULT_RETURN_URI = 'https://lyvonthai.com/checkout.html';
 
 // ------------------------------------------------------------
+// SUPABASE (order + member database)
+//
+// We talk to Supabase's built-in REST API (PostgREST) directly with
+// fetch() instead of adding the @supabase/supabase-js package — this
+// keeps the server to zero new dependencies, which matters since this
+// repo is edited through GitHub's web editor rather than a local dev
+// setup with npm install.
+//
+// Required env vars on Render:
+//   SUPABASE_URL          e.g. https://xxxxxxxx.supabase.co
+//   SUPABASE_SERVICE_KEY   the "secret key (default)" from Supabase → API Keys
+//   ADMIN_KEY               any password you choose, used to protect /admin/*
+// ------------------------------------------------------------
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
+
+async function supabaseRequest(path, options = {}) {
+  return fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
+    ...options,
+    headers: {
+      'Content-Type': 'application/json',
+      apikey: SUPABASE_SERVICE_KEY,
+      Authorization: `Bearer ${SUPABASE_SERVICE_KEY}`,
+      ...(options.headers || {}),
+    },
+  });
+}
+
+// Writes (or updates, if we've already seen this charge id before) one row
+// into the `orders` table from a live Omise charge object. Safe to call more
+// than once for the same charge (e.g. every time /charge-status is polled) —
+// it upserts on charge_id, so the row's status just gets kept up to date.
+async function saveOrderFromCharge(charge) {
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
+    console.error('Supabase not configured — SUPABASE_URL / SUPABASE_SERVICE_KEY missing, order not saved');
+    return;
+  }
+  try {
+    let items = [];
+    try { items = JSON.parse(charge?.metadata?.items_json || '[]'); } catch (e) { items = []; }
+    const paymentMethod = charge?.card ? 'card' : (charge?.source && charge.source.type) || 'unknown';
+    const row = {
+      charge_id: charge.id,
+      customer_name: charge?.metadata?.customer_name || '',
+      customer_phone: charge?.metadata?.customer_phone || '',
+      shipping_address: charge?.metadata?.shipping_address || '',
+      items,
+      amount: charge.amount,
+      currency: charge.currency,
+      payment_method: paymentMethod,
+      status: charge.status,
+    };
+    const res = await supabaseRequest('orders?on_conflict=charge_id', {
+      method: 'POST',
+      headers: { Prefer: 'resolution=merge-duplicates,return=minimal' },
+      body: JSON.stringify(row),
+    });
+    if (!res.ok) {
+      console.error('Supabase order save failed:', res.status, await res.text());
+    }
+  } catch (err) {
+    console.error('Supabase order save error:', err);
+  }
+}
+
+// ------------------------------------------------------------
 // POST /charge  (card payments)
-// body: { omiseToken, amount, currency, customer: { name, phone, address }, returnUri }
+// body: { omiseToken, amount, currency, customer: { name, phone, address }, items, returnUri }
 // ------------------------------------------------------------
 app.post('/charge', async (req, res) => {
-  const { omiseToken, amount, currency, customer, returnUri } = req.body;
+  const { omiseToken, amount, currency, customer, items, returnUri } = req.body;
 
   if (!omiseToken || !amount || !currency) {
     return res.status(400).json({ success: false, message: 'Missing required fields' });
@@ -62,12 +134,16 @@ app.post('/charge', async (req, res) => {
         customer_name: customer?.name || '',
         customer_phone: customer?.phone || '',
         shipping_address: customer?.address || '',
+        items_json: JSON.stringify(items || []),
       },
     });
 
+    // Record this charge attempt in the order database no matter how it
+    // turns out (successful / pending-3DS / failed) — this is what lets the
+    // admin page show the full picture, not just completed sales.
+    await saveOrderFromCharge(charge);
+
     if (charge.status === 'successful' || charge.paid) {
-      // TODO: save the order to your database here
-      // TODO: send order confirmation (e.g. LINE Notify, email) here
       return res.json({ success: true, chargeId: charge.id });
     }
 
@@ -97,21 +173,18 @@ app.post('/charge', async (req, res) => {
 // ------------------------------------------------------------
 // POST /promptpay-charge
 //
-// This is the fix for "손님이 담은 금액만큼 딱 결제를 청구해야 한다":
-// instead of a static QR where the customer types in whatever amount
-// they feel like, we create a real Omise PromptPay Source for the
-// EXACT order total. The QR that comes back has that amount baked
-// into it — scanning it in any Thai banking app pre-fills the amount
-// and the customer CANNOT change it or pay a different amount.
+// Creates a real Omise PromptPay Source for the EXACT order total, so the
+// QR that comes back has that amount baked in — the customer cannot pay a
+// different amount.
 //
-// body: { amount, currency, customer: { name, phone, address } }
+// body: { amount, currency, customer: { name, phone, address }, items }
 //   amount   = integer, in satang (THB total x 100) — e.g. ฿2,150 -> 215000
 //   currency = "thb"
 //
 // response: { success, chargeId, status, qrImageBase64, expiresAt }
 // ------------------------------------------------------------
 app.post('/promptpay-charge', async (req, res) => {
-  const { amount, currency, customer } = req.body;
+  const { amount, currency, customer, items } = req.body;
 
   if (!amount || !currency) {
     return res.status(400).json({ success: false, message: 'Missing required fields' });
@@ -141,8 +214,13 @@ app.post('/promptpay-charge', async (req, res) => {
         customer_name: customer?.name || '',
         customer_phone: customer?.phone || '',
         shipping_address: customer?.address || '',
+        items_json: JSON.stringify(items || []),
       },
     });
+
+    // Record the attempt right away (status will be "pending" here — the
+    // row gets updated to "successful" once /charge-status sees it paid).
+    await saveOrderFromCharge(charge);
 
     // 3. Fetch the QR image bytes from Omise (requires secret-key auth,
     //    which is why this has to happen on the server, not the browser)
@@ -189,11 +267,14 @@ app.post('/promptpay-charge', async (req, res) => {
 // the customer returns from a 3-D Secure redirect. Only when this reports
 // paid=true / status="successful" should the site tell the customer their
 // order is confirmed and notify LINE — this is what guarantees the FULL,
-// EXACT amount actually arrived.
+// EXACT amount actually arrived. Each poll also refreshes the order's row
+// in the database, so a PromptPay order's status moves from "pending" to
+// "successful" (or "failed"/"expired") automatically.
 // ------------------------------------------------------------
 app.get('/charge-status/:id', async (req, res) => {
   try {
     const charge = await omise.charges.retrieve(req.params.id);
+    await saveOrderFromCharge(charge);
     return res.json({
       success: true,
       status: charge.status,   // "pending" | "successful" | "failed" | "expired" | "reversed"
@@ -204,6 +285,105 @@ app.get('/charge-status/:id', async (req, res) => {
   } catch (err) {
     console.error('Omise charge-status error:', err?.message || err);
     return res.status(500).json({ success: false, message: 'Server error while checking charge status' });
+  }
+});
+
+// ------------------------------------------------------------
+// Password hashing (built into Node, no extra dependency needed)
+// ------------------------------------------------------------
+function hashPassword(password) {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const hash = crypto.scryptSync(password, salt, 64).toString('hex');
+  return `${salt}:${hash}`;
+}
+
+// ------------------------------------------------------------
+// POST /signup
+// body: { email, password, name, phone }
+// ------------------------------------------------------------
+app.post('/signup', async (req, res) => {
+  const { email, password, name, phone } = req.body;
+
+  if (!email || !password) {
+    return res.status(400).json({ success: false, message: 'Email and password are required' });
+  }
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
+    return res.status(500).json({ success: false, message: 'Database is not configured yet' });
+  }
+
+  try {
+    const row = {
+      email: String(email).trim().toLowerCase(),
+      password_hash: hashPassword(password),
+      name: name || '',
+      phone: phone || '',
+    };
+    const sbRes = await supabaseRequest('members', {
+      method: 'POST',
+      headers: { Prefer: 'return=minimal' },
+      body: JSON.stringify(row),
+    });
+
+    if (sbRes.ok) {
+      return res.json({ success: true });
+    }
+
+    const errText = await sbRes.text();
+    if (sbRes.status === 409 || errText.includes('duplicate key')) {
+      return res.status(409).json({ success: false, message: 'This email is already registered' });
+    }
+    console.error('Supabase signup error:', sbRes.status, errText);
+    return res.status(500).json({ success: false, message: 'Server error while creating account' });
+  } catch (err) {
+    console.error('Signup error:', err);
+    return res.status(500).json({ success: false, message: 'Server error while creating account' });
+  }
+});
+
+// ------------------------------------------------------------
+// Admin endpoints — protected by a shared secret (ADMIN_KEY env var).
+// The admin.html page asks for this key once and sends it as the
+// x-admin-key header on every request.
+// ------------------------------------------------------------
+function requireAdminKey(req, res) {
+  const key = req.headers['x-admin-key'];
+  if (!process.env.ADMIN_KEY || key !== process.env.ADMIN_KEY) {
+    res.status(401).json({ success: false, message: 'Unauthorized' });
+    return false;
+  }
+  return true;
+}
+
+app.get('/admin/orders', async (req, res) => {
+  if (!requireAdminKey(req, res)) return;
+  try {
+    const sbRes = await supabaseRequest('orders?select=*&order=created_at.desc&limit=300');
+    if (!sbRes.ok) {
+      console.error('Admin orders fetch failed:', sbRes.status, await sbRes.text());
+      return res.status(500).json({ success: false, message: 'Server error' });
+    }
+    const data = await sbRes.json();
+    return res.json({ success: true, orders: data });
+  } catch (err) {
+    console.error('Admin orders fetch error:', err);
+    return res.status(500).json({ success: false, message: 'Server error' });
+  }
+});
+
+app.get('/admin/members', async (req, res) => {
+  if (!requireAdminKey(req, res)) return;
+  try {
+    // Never select password_hash here.
+    const sbRes = await supabaseRequest('members?select=id,email,name,phone,created_at&order=created_at.desc&limit=1000');
+    if (!sbRes.ok) {
+      console.error('Admin members fetch failed:', sbRes.status, await sbRes.text());
+      return res.status(500).json({ success: false, message: 'Server error' });
+    }
+    const data = await sbRes.json();
+    return res.json({ success: true, members: data });
+  } catch (err) {
+    console.error('Admin members fetch error:', err);
+    return res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
