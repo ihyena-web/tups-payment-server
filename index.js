@@ -24,8 +24,11 @@
 //   POST /signup                 — create a member account (password is
 //                                   hashed before it's ever stored)
 //   POST /login                  — verify a member's email + password
+//   GET  /my-orders               — a logged-in member's own order history
 //   GET  /admin/orders           — list all orders (requires x-admin-key header)
 //   GET  /admin/members          — list all signed-up members (requires x-admin-key header)
+//   PATCH /admin/orders/:chargeId — update shipping_status / tracking_number /
+//                                   courier for one order (requires x-admin-key header)
 // ============================================================
 
 require('dotenv').config();
@@ -94,11 +97,17 @@ async function saveOrderFromCharge(charge) {
       customer_name: charge?.metadata?.customer_name || '',
       customer_phone: charge?.metadata?.customer_phone || '',
       shipping_address: charge?.metadata?.shipping_address || '',
+      member_email: (charge?.metadata?.member_email || '').toLowerCase() || null,
       items,
       amount: charge.amount,
       currency: charge.currency,
       payment_method: paymentMethod,
       status: charge.status,
+      // Deliberately NOT including shipping_status / tracking_number / courier
+      // here: those are set later by /admin (or, once wired up, automatically
+      // by the courier integration) and must survive every repeat call this
+      // function gets from /charge-status polling. Omitting a key from this
+      // upsert leaves whatever is already in that column untouched.
     };
     const res = await supabaseRequest('orders?on_conflict=charge_id', {
       method: 'POST',
@@ -115,10 +124,10 @@ async function saveOrderFromCharge(charge) {
 
 // ------------------------------------------------------------
 // POST /charge  (card payments)
-// body: { omiseToken, amount, currency, customer: { name, phone, address }, items, returnUri }
+// body: { omiseToken, amount, currency, customer: { name, phone, address }, items, returnUri, memberEmail }
 // ------------------------------------------------------------
 app.post('/charge', async (req, res) => {
-  const { omiseToken, amount, currency, customer, items, returnUri } = req.body;
+  const { omiseToken, amount, currency, customer, items, returnUri, memberEmail } = req.body;
 
   if (!omiseToken || !amount || !currency) {
     return res.status(400).json({ success: false, message: 'Missing required fields' });
@@ -136,6 +145,9 @@ app.post('/charge', async (req, res) => {
         customer_phone: customer?.phone || '',
         shipping_address: customer?.address || '',
         items_json: JSON.stringify(items || []),
+        // Only set when the customer was logged in at checkout — lets /my-orders
+        // find this order later. Guest checkouts simply have no member_email.
+        member_email: memberEmail || '',
       },
     });
 
@@ -178,14 +190,14 @@ app.post('/charge', async (req, res) => {
 // QR that comes back has that amount baked in — the customer cannot pay a
 // different amount.
 //
-// body: { amount, currency, customer: { name, phone, address }, items }
+// body: { amount, currency, customer: { name, phone, address }, items, memberEmail }
 //   amount   = integer, in satang (THB total x 100) — e.g. ฿2,150 -> 215000
 //   currency = "thb"
 //
 // response: { success, chargeId, status, qrImageBase64, expiresAt }
 // ------------------------------------------------------------
 app.post('/promptpay-charge', async (req, res) => {
-  const { amount, currency, customer, items } = req.body;
+  const { amount, currency, customer, items, memberEmail } = req.body;
 
   if (!amount || !currency) {
     return res.status(400).json({ success: false, message: 'Missing required fields' });
@@ -216,6 +228,7 @@ app.post('/promptpay-charge', async (req, res) => {
         customer_phone: customer?.phone || '',
         shipping_address: customer?.address || '',
         items_json: JSON.stringify(items || []),
+        member_email: memberEmail || '',
       },
     });
 
@@ -412,6 +425,40 @@ app.post('/login', async (req, res) => {
 });
 
 // ------------------------------------------------------------
+// GET /my-orders?email=...
+//
+// Lets a logged-in customer see their own order history, including the
+// shipping status (order_placed / preparing / shipped / delivered) and
+// tracking number once one is set. There's no login token/session here —
+// the frontend just sends the email it has stored from /login — so this
+// is a lightweight convenience, not a hardened private endpoint. Good
+// enough for a small membership site; revisit if that ever matters more.
+// ------------------------------------------------------------
+app.get('/my-orders', async (req, res) => {
+  const email = String(req.query.email || '').trim().toLowerCase();
+  if (!email) {
+    return res.status(400).json({ success: false, message: 'Email is required' });
+  }
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
+    return res.status(500).json({ success: false, message: 'Database is not configured yet' });
+  }
+  try {
+    const sbRes = await supabaseRequest(
+      `orders?member_email=eq.${encodeURIComponent(email)}&select=charge_id,items,amount,currency,payment_method,status,shipping_status,tracking_number,courier,created_at&order=created_at.desc&limit=200`
+    );
+    if (!sbRes.ok) {
+      console.error('My-orders fetch failed:', sbRes.status, await sbRes.text());
+      return res.status(500).json({ success: false, message: 'Server error' });
+    }
+    const data = await sbRes.json();
+    return res.json({ success: true, orders: data });
+  } catch (err) {
+    console.error('My-orders fetch error:', err);
+    return res.status(500).json({ success: false, message: 'Server error' });
+  }
+});
+
+// ------------------------------------------------------------
 // Admin endpoints — protected by a shared secret (ADMIN_KEY env var).
 // The admin.html page asks for this key once and sends it as the
 // x-admin-key header on every request.
@@ -437,6 +484,42 @@ app.get('/admin/orders', async (req, res) => {
     return res.json({ success: true, orders: data });
   } catch (err) {
     console.error('Admin orders fetch error:', err);
+    return res.status(500).json({ success: false, message: 'Server error' });
+  }
+});
+
+// PATCH /admin/orders/:chargeId
+// body: { shipping_status?, tracking_number?, courier? }
+// Manual way to move an order through order_placed -> preparing -> shipped
+// -> delivered and attach a tracking number, until the Kerry Express API
+// integration is wired up to do this automatically.
+app.patch('/admin/orders/:chargeId', async (req, res) => {
+  if (!requireAdminKey(req, res)) return;
+  const { shipping_status, tracking_number, courier } = req.body;
+  const ALLOWED_STATUSES = ['order_placed', 'preparing', 'shipped', 'delivered'];
+  if (shipping_status && !ALLOWED_STATUSES.includes(shipping_status)) {
+    return res.status(400).json({ success: false, message: 'Invalid shipping_status' });
+  }
+  const patch = {};
+  if (shipping_status !== undefined) patch.shipping_status = shipping_status;
+  if (tracking_number !== undefined) patch.tracking_number = tracking_number;
+  if (courier !== undefined) patch.courier = courier;
+  if (Object.keys(patch).length === 0) {
+    return res.status(400).json({ success: false, message: 'Nothing to update' });
+  }
+  try {
+    const sbRes = await supabaseRequest(`orders?charge_id=eq.${encodeURIComponent(req.params.chargeId)}`, {
+      method: 'PATCH',
+      headers: { Prefer: 'return=minimal' },
+      body: JSON.stringify(patch),
+    });
+    if (!sbRes.ok) {
+      console.error('Admin order update failed:', sbRes.status, await sbRes.text());
+      return res.status(500).json({ success: false, message: 'Server error' });
+    }
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('Admin order update error:', err);
     return res.status(500).json({ success: false, message: 'Server error' });
   }
 });
