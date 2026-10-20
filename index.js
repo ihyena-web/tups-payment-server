@@ -23,6 +23,7 @@
 //                                   customer their order is confirmed
 //   POST /signup                 — create a member account (password is
 //                                   hashed before it's ever stored)
+//   POST /login                  — verify a member's email + password
 //   GET  /admin/orders           — list all orders (requires x-admin-key header)
 //   GET  /admin/members          — list all signed-up members (requires x-admin-key header)
 // ============================================================
@@ -291,10 +292,29 @@ app.get('/charge-status/:id', async (req, res) => {
 // ------------------------------------------------------------
 // Password hashing (built into Node, no extra dependency needed)
 // ------------------------------------------------------------
+// Must include an uppercase letter, a lowercase letter, and at least one
+// symbol (non-letter, non-number character), minimum 8 characters total.
+// Kept in sync with the same rule enforced in signup.html on the frontend —
+// this is the real gate, since the frontend check alone can be bypassed.
+const PASSWORD_RULE = /^(?=.*[A-Z])(?=.*[a-z])(?=.*[^A-Za-z0-9]).{8,}$/;
+
 function hashPassword(password) {
   const salt = crypto.randomBytes(16).toString('hex');
   const hash = crypto.scryptSync(password, salt, 64).toString('hex');
   return `${salt}:${hash}`;
+}
+
+function verifyPassword(password, stored) {
+  const [salt, hash] = String(stored || '').split(':');
+  if (!salt || !hash) return false;
+  try {
+    const hashBuffer = Buffer.from(hash, 'hex');
+    const suppliedBuffer = crypto.scryptSync(password, salt, 64);
+    if (hashBuffer.length !== suppliedBuffer.length) return false;
+    return crypto.timingSafeEqual(hashBuffer, suppliedBuffer);
+  } catch (e) {
+    return false;
+  }
 }
 
 // ------------------------------------------------------------
@@ -306,6 +326,12 @@ app.post('/signup', async (req, res) => {
 
   if (!email || !password) {
     return res.status(400).json({ success: false, message: 'Email and password are required' });
+  }
+  if (!PASSWORD_RULE.test(password)) {
+    return res.status(400).json({
+      success: false,
+      message: 'Password must include an uppercase letter, a lowercase letter, and a symbol, with at least 8 characters.',
+    });
   }
   if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
     return res.status(500).json({ success: false, message: 'Database is not configured yet' });
@@ -337,6 +363,51 @@ app.post('/signup', async (req, res) => {
   } catch (err) {
     console.error('Signup error:', err);
     return res.status(500).json({ success: false, message: 'Server error while creating account' });
+  }
+});
+
+// ------------------------------------------------------------
+// POST /login
+// body: { email, password }
+// Note: this is a lightweight check, not a full session/auth system —
+// there's no login token issued. The frontend just remembers the
+// returned member info locally after a successful check. Good enough
+// for a simple membership page; upgrade later if real account pages
+// (order history, saved addresses, etc.) get built.
+// ------------------------------------------------------------
+app.post('/login', async (req, res) => {
+  const { email, password } = req.body;
+
+  if (!email || !password) {
+    return res.status(400).json({ success: false, message: 'Email and password are required' });
+  }
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
+    return res.status(500).json({ success: false, message: 'Database is not configured yet' });
+  }
+
+  try {
+    const normalizedEmail = String(email).trim().toLowerCase();
+    const sbRes = await supabaseRequest(
+      `members?email=eq.${encodeURIComponent(normalizedEmail)}&select=id,email,name,phone,password_hash`
+    );
+    if (!sbRes.ok) {
+      console.error('Supabase login lookup failed:', sbRes.status, await sbRes.text());
+      return res.status(500).json({ success: false, message: 'Server error while logging in' });
+    }
+    const rows = await sbRes.json();
+    const member = rows[0];
+
+    if (!member || !verifyPassword(password, member.password_hash)) {
+      return res.status(401).json({ success: false, message: 'Incorrect email or password' });
+    }
+
+    return res.json({
+      success: true,
+      member: { id: member.id, email: member.email, name: member.name, phone: member.phone },
+    });
+  } catch (err) {
+    console.error('Login error:', err);
+    return res.status(500).json({ success: false, message: 'Server error while logging in' });
   }
 });
 
