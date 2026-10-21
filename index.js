@@ -25,6 +25,10 @@
 //                                   hashed before it's ever stored). Also
 //                                   grants 3 welcome coupons automatically.
 //   POST /login                  — verify a member's email + password
+//   POST /forgot-password        — emails a password reset link (via Resend)
+//                                   if that email has an account
+//   POST /reset-password         — sets a new password given a valid,
+//                                   unexpired reset token from that email
 //   GET  /my-coupons             — a logged-in member's own coupons (used +
 //                                   unused), shown at checkout
 //   GET  /my-orders               — a logged-in member's own order history
@@ -54,6 +58,42 @@ app.use(express.json());
 // Omise redirects the customer's browser here after they complete their
 // bank's verification step.
 const DEFAULT_RETURN_URI = 'https://lyvonthai.com/checkout.html';
+const SITE_BASE_URL = 'https://lyvonthai.com';
+
+// ------------------------------------------------------------
+// RESEND (transactional email — used only for "forgot password" reset links)
+//
+// Same reasoning as Supabase above: talk to Resend's REST API directly with
+// fetch() instead of adding their SDK as a dependency.
+//
+// Required env vars on Render:
+//   RESEND_API_KEY    from resend.com → API Keys
+//   RESEND_FROM_EMAIL e.g. "LYVON x TUPS Thailand <no-reply@lyvonthai.com>" —
+//                     the sending address must be on a domain verified in
+//                     Resend (lyvonthai.com), or emails will fail to send to
+//                     anyone but your own Resend account email.
+// ------------------------------------------------------------
+const RESEND_API_KEY = process.env.RESEND_API_KEY;
+const RESEND_FROM_EMAIL = process.env.RESEND_FROM_EMAIL || 'LYVON x TUPS Thailand <onboarding@resend.dev>';
+
+async function sendEmail({ to, subject, html }) {
+  if (!RESEND_API_KEY) {
+    console.error('RESEND_API_KEY not set — cannot send email (this request will still report success to avoid leaking which emails are registered, but no email was actually sent)');
+    return;
+  }
+  try {
+    const res = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${RESEND_API_KEY}` },
+      body: JSON.stringify({ from: RESEND_FROM_EMAIL, to: [to], subject, html }),
+    });
+    if (!res.ok) {
+      console.error('Resend email send failed:', res.status, await res.text());
+    }
+  } catch (err) {
+    console.error('Resend email send error:', err);
+  }
+}
 
 // ------------------------------------------------------------
 // SUPABASE (order + member database)
@@ -555,6 +595,122 @@ app.post('/login', async (req, res) => {
   } catch (err) {
     console.error('Login error:', err);
     return res.status(500).json({ success: false, message: 'Server error while logging in' });
+  }
+});
+
+// ------------------------------------------------------------
+// POST /forgot-password
+// body: { email }
+//
+// Always responds success:true, whether or not that email actually has an
+// account — otherwise this endpoint could be used to check which emails are
+// registered. If it IS registered, a random reset token is generated,
+// stored on that member with a 1-hour expiry, and emailed as a reset link
+// via Resend. The password itself is never touched until /reset-password is
+// called with that exact token.
+// ------------------------------------------------------------
+app.post('/forgot-password', async (req, res) => {
+  const { email } = req.body;
+  if (!email) {
+    return res.status(400).json({ success: false, message: 'Email is required' });
+  }
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
+    return res.status(500).json({ success: false, message: 'Database is not configured yet' });
+  }
+
+  const genericResponse = { success: true, message: 'If that email has an account, a password reset link has been sent.' };
+
+  try {
+    const normalizedEmail = String(email).trim().toLowerCase();
+    const sbRes = await supabaseRequest(`members?email=eq.${encodeURIComponent(normalizedEmail)}&select=id,email,name`);
+    if (!sbRes.ok) {
+      console.error('Forgot-password lookup failed:', sbRes.status, await sbRes.text());
+      return res.json(genericResponse); // still generic — a lookup error shouldn't leak anything either
+    }
+    const rows = await sbRes.json();
+    const member = rows[0];
+    if (member) {
+      const token = crypto.randomBytes(32).toString('hex');
+      const expiresAt = new Date(Date.now() + 60 * 60 * 1000).toISOString(); // 1 hour
+      await supabaseRequest(`members?id=eq.${encodeURIComponent(member.id)}`, {
+        method: 'PATCH',
+        headers: { Prefer: 'return=minimal' },
+        body: JSON.stringify({ reset_token: token, reset_token_expires: expiresAt }),
+      });
+      const resetUrl = `${SITE_BASE_URL}/reset-password.html?token=${token}`;
+      await sendEmail({
+        to: member.email,
+        subject: 'Reset your password — LYVON x TUPS Thailand',
+        html: `
+          <div style="font-family:sans-serif; max-width:480px; margin:0 auto;">
+            <p>Hi ${member.name || 'there'},</p>
+            <p>We received a request to reset your LYVON x TUPS Thailand account password. Click the button below to choose a new one — this link expires in 1 hour.</p>
+            <p style="margin:28px 0;"><a href="${resetUrl}" style="background:#111; color:#fff; padding:13px 26px; text-decoration:none; border-radius:2px; font-weight:600;">Reset Password</a></p>
+            <p style="color:#6B6B6B; font-size:13px;">Or copy this link: ${resetUrl}</p>
+            <p style="color:#6B6B6B; font-size:13px;">If you didn't request this, you can safely ignore this email — your password won't be changed.</p>
+          </div>
+        `,
+      });
+    }
+  } catch (err) {
+    console.error('Forgot-password error:', err);
+    // fall through — same generic response either way
+  }
+
+  return res.json(genericResponse);
+});
+
+// ------------------------------------------------------------
+// POST /reset-password
+// body: { token, password }
+//
+// Sets a new password if — and only if — the token matches a member AND
+// hasn't expired (1 hour from when /forgot-password issued it). The token
+// is cleared immediately after use, so a reset link only ever works once.
+// ------------------------------------------------------------
+app.post('/reset-password', async (req, res) => {
+  const { token, password } = req.body;
+  if (!token || !password) {
+    return res.status(400).json({ success: false, message: 'Missing required fields' });
+  }
+  if (!PASSWORD_RULE.test(password)) {
+    return res.status(400).json({
+      success: false,
+      message: 'Password must include an uppercase letter, a lowercase letter, and a symbol, with at least 8 characters.',
+    });
+  }
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
+    return res.status(500).json({ success: false, message: 'Database is not configured yet' });
+  }
+
+  try {
+    const sbRes = await supabaseRequest(`members?reset_token=eq.${encodeURIComponent(token)}&select=id,reset_token_expires`);
+    if (!sbRes.ok) {
+      console.error('Reset-password lookup failed:', sbRes.status, await sbRes.text());
+      return res.status(500).json({ success: false, message: 'Server error' });
+    }
+    const rows = await sbRes.json();
+    const member = rows[0];
+    if (!member) {
+      return res.status(400).json({ success: false, message: 'This reset link is invalid or has already been used.' });
+    }
+    if (!member.reset_token_expires || new Date(member.reset_token_expires).getTime() < Date.now()) {
+      return res.status(400).json({ success: false, message: 'This reset link has expired. Please request a new one.' });
+    }
+
+    const patchRes = await supabaseRequest(`members?id=eq.${encodeURIComponent(member.id)}`, {
+      method: 'PATCH',
+      headers: { Prefer: 'return=minimal' },
+      body: JSON.stringify({ password_hash: hashPassword(password), reset_token: null, reset_token_expires: null }),
+    });
+    if (!patchRes.ok) {
+      console.error('Reset-password update failed:', patchRes.status, await patchRes.text());
+      return res.status(500).json({ success: false, message: 'Server error while resetting your password' });
+    }
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('Reset-password error:', err);
+    return res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
