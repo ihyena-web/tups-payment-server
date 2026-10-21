@@ -1315,6 +1315,34 @@ app.post('/my-orders/:chargeId/cancel', async (req, res) => {
       }
     }
 
+    // A cancelled order never really "happened", so a welcome coupon it
+    // spent was never actually used — give it back. Only restores a coupon
+    // that's still marked used AND still points at THIS charge (so an
+    // already-reused-elsewhere coupon, which shouldn't be possible given
+    // coupons can only be spent once, is never touched by mistake).
+    async function reverseCouponForOrder() {
+      const couponId = order.coupon_id;
+      if (!couponId) return;
+      try {
+        const getRes = await supabaseRequest(`coupons?id=eq.${encodeURIComponent(couponId)}&select=id,used,order_charge_id`);
+        if (!getRes.ok) return;
+        const rows = await getRes.json();
+        const coupon = rows && rows[0];
+        if (!coupon || !coupon.used) return;
+        if (String(coupon.order_charge_id || '') !== String(chargeId)) return;
+        const patchRes = await supabaseRequest(`coupons?id=eq.${encodeURIComponent(couponId)}`, {
+          method: 'PATCH',
+          headers: { Prefer: 'return=minimal' },
+          body: JSON.stringify({ used: false, used_at: null, order_charge_id: null }),
+        });
+        if (!patchRes.ok) {
+          console.error('Coupon reversal failed:', patchRes.status, await patchRes.text());
+        }
+      } catch (err) {
+        console.error('Coupon reversal error:', err?.message || err);
+      }
+    }
+
     if (order.payment_method === 'card') {
       // Real Omise refund — this is the part that actually reverses the
       // card charge and returns the money to the customer's card.
@@ -1326,6 +1354,7 @@ app.post('/my-orders/:chargeId/cancel', async (req, res) => {
       const charge = await omise.charges.retrieve(chargeId);
       await saveOrderFromCharge(charge);
       await reversePointsLedgerForCharge();
+      await reverseCouponForOrder();
 
       await supabaseRequest(`orders?charge_id=eq.${encodeURIComponent(chargeId)}`, {
         method: 'PATCH',
@@ -1342,6 +1371,7 @@ app.post('/my-orders/:chargeId/cancel', async (req, res) => {
     // above already makes the member whole, so that one is "refunded"
     // immediately rather than left pending.
     await reversePointsLedgerForCharge();
+    await reverseCouponForOrder();
     const isStoreCreditOrder = order.payment_method === 'store_credit';
     await supabaseRequest(`orders?charge_id=eq.${encodeURIComponent(chargeId)}`, {
       method: 'PATCH',
