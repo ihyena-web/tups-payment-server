@@ -522,6 +522,27 @@ app.post('/signup', async (req, res) => {
   }
 
   try {
+    // Catch "you already signed up with this number" before even trying the
+    // insert — the email's uniqueness is already enforced by the DB's
+    // duplicate-key error below, but phone has no such constraint, so it
+    // needs its own lookup. A simple trimmed exact match; it won't catch
+    // the same number typed with different dashes/spacing, but covers the
+    // common case of someone just retyping the number they always use.
+    const normalizedPhone = String(phone || '').trim();
+    if (normalizedPhone) {
+      const phoneCheckRes = await supabaseRequest(`members?phone=eq.${encodeURIComponent(normalizedPhone)}&select=id`);
+      if (phoneCheckRes.ok) {
+        const existingByPhone = await phoneCheckRes.json();
+        if (existingByPhone.length > 0) {
+          return res.status(409).json({
+            success: false,
+            reason: 'phone_exists',
+            message: "You've already signed up with this phone number. Did you forget your password?",
+          });
+        }
+      }
+    }
+
     const row = {
       email: String(email).trim().toLowerCase(),
       password_hash: hashPassword(password),
@@ -543,7 +564,7 @@ app.post('/signup', async (req, res) => {
 
     const errText = await sbRes.text();
     if (sbRes.status === 409 || errText.includes('duplicate key')) {
-      return res.status(409).json({ success: false, message: 'This email is already registered' });
+      return res.status(409).json({ success: false, reason: 'email_exists', message: 'This email is already registered' });
     }
     console.error('Supabase signup error:', sbRes.status, errText);
     return res.status(500).json({ success: false, message: 'Server error while creating account' });
