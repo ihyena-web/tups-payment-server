@@ -31,6 +31,9 @@
 //                                   unexpired reset token from that email
 //   GET  /my-coupons             — a logged-in member's own coupons (used +
 //                                   unused), shown at checkout
+//   GET  /my-points              — a logged-in member's store-credit
+//                                   (points) balance, shown at checkout +
+//                                   on my-orders.html
 //   GET  /my-orders               — a logged-in member's own order history
 //   POST /my-orders/:chargeId/cancel — customer self-cancels + refunds their
 //                                   own order (only before it has shipped)
@@ -175,6 +178,7 @@ async function saveOrderFromCharge(charge) {
     const paymentMethod = charge?.card ? 'card' : (charge?.source && charge.source.type) || 'unknown';
     const discountAmount = Number(charge?.metadata?.discount_satang) || 0;
     const couponId = charge?.metadata?.coupon_id || null;
+    const pointsUsedAmount = Number(charge?.metadata?.points_used_satang) || 0;
     const row = {
       charge_id: charge.id,
       order_number: makeOrderNumber(charge.id, charge.created_at),
@@ -187,6 +191,7 @@ async function saveOrderFromCharge(charge) {
       amount: charge.amount,
       discount_amount: discountAmount,
       coupon_id: couponId,
+      points_used: pointsUsedAmount,
       currency: charge.currency,
       payment_method: paymentMethod,
       status: charge.status,
@@ -234,6 +239,7 @@ async function saveOrderFromCharge(charge) {
     // "successful", never on an earlier pending save or a later repeat poll.
     if (charge.status === 'successful' && previousStatus !== 'successful') {
       notifyAdminOfNewOrder(row).catch(err => console.error('Order notification email error:', err));
+      processPointsForOrder(row, charge).catch(err => console.error('Points processing error:', err));
     }
   } catch (err) {
     console.error('Supabase order save error:', err);
@@ -271,6 +277,111 @@ async function notifyAdminOfNewOrder(row) {
   });
 }
 
+// Reads every points_ledger row for a member (oldest first) and replays it
+// to get their CURRENTLY VALID store-credit balance — "valid" meaning not
+// expired. Each membership purchase ("credit" row) carries its own
+// expires_at (purchase date + 1 year); each checkout redemption ("debit"
+// row) is consumed against the oldest still-open credit batches first
+// (FIFO), same as how the credit would actually get used up in practice.
+// Whatever's left in a batch once its expires_at has passed is simply
+// excluded from the total — expired credit is gone, whether or not it was
+// ever spent. This is computed fresh on every read rather than cached in a
+// members.points_balance column, so expiry is always correctly reflected
+// without a separate cron job to "expire" anything.
+async function computeValidPointsBalance(memberEmail) {
+  const res = await supabaseRequest(
+    `points_ledger?member_email=eq.${encodeURIComponent(memberEmail)}&select=type,amount,expires_at,created_at&order=created_at.asc`
+  );
+  if (!res.ok) return 0;
+  const rows = await res.json();
+  const batches = []; // { remaining, expiresAtMs }
+  for (const r of rows) {
+    if (r.type === 'credit') {
+      batches.push({
+        remaining: Number(r.amount) || 0,
+        expiresAtMs: r.expires_at ? new Date(r.expires_at).getTime() : null,
+      });
+    } else if (r.type === 'debit') {
+      let toConsume = Number(r.amount) || 0;
+      for (const b of batches) {
+        if (toConsume <= 0) break;
+        const take = Math.min(b.remaining, toConsume);
+        b.remaining -= take;
+        toConsume -= take;
+      }
+    }
+  }
+  const now = Date.now();
+  return batches.reduce((sum, b) => sum + (b.expiresAtMs === null || b.expiresAtMs > now ? b.remaining : 0), 0);
+}
+
+// Credits membership purchases and debits any store credit the customer
+// applied at checkout — exactly once per charge, no matter how many times
+// saveOrderFromCharge() gets called for it (creation, 3DS return, PromptPay
+// poll). Each charge can write up to two points_ledger rows (a 'credit' row
+// if it contained a membership item, a 'debit' row if store credit was
+// applied) — both guarded by a UNIQUE (charge_id, type) constraint, so a
+// repeat call that already wrote one or both rows just has those inserts
+// silently ignored instead of double-crediting/double-debiting.
+async function processPointsForOrder(row, charge) {
+  try {
+    const memberEmail = row.member_email;
+    if (!memberEmail) return; // guest checkouts have no points balance to touch
+
+    // Membership credit — computed from the SERVER's own MEMBERSHIP_TIERS
+    // table, matched by each item's per-unit price, never trusted from the
+    // client directly. A tampered/unknown price simply earns no credit.
+    const membershipItems = (Array.isArray(row.items) ? row.items : []).filter(it => it && it.membership);
+    let pointsCredited = 0;
+    const tierKeys = [];
+    for (const it of membershipItems) {
+      const tier = MEMBERSHIP_TIERS.find(t => t.price === Number(it.price));
+      if (tier) {
+        pointsCredited += tier.points * (Number(it.qty) || 0);
+        tierKeys.push(String(tier.price));
+      }
+    }
+    const pointsUsed = Math.round((Number(charge?.metadata?.points_used_satang) || 0) / 100);
+    if (!pointsCredited && !pointsUsed) return; // nothing to do for this order
+
+    const rowsToInsert = [];
+    if (pointsCredited > 0) {
+      const expiresAt = new Date(Date.now() + MEMBERSHIP_POINTS_EXPIRY_DAYS * 24 * 60 * 60 * 1000).toISOString();
+      rowsToInsert.push({
+        member_email: memberEmail,
+        charge_id: charge.id,
+        order_number: row.order_number,
+        type: 'credit',
+        amount: pointsCredited,
+        tier: tierKeys.join(','),
+        expires_at: expiresAt,
+      });
+    }
+    if (pointsUsed > 0) {
+      rowsToInsert.push({
+        member_email: memberEmail,
+        charge_id: charge.id,
+        order_number: row.order_number,
+        type: 'debit',
+        amount: pointsUsed,
+        tier: null,
+        expires_at: null,
+      });
+    }
+
+    const insertRes = await supabaseRequest('points_ledger', {
+      method: 'POST',
+      headers: { Prefer: 'return=representation,resolution=ignore-duplicates' },
+      body: JSON.stringify(rowsToInsert),
+    });
+    if (!insertRes.ok) {
+      console.error('Points ledger insert failed:', insertRes.status, await insertRes.text());
+    }
+  } catch (err) {
+    console.error('processPointsForOrder error:', err);
+  }
+}
+
 // ------------------------------------------------------------
 // Welcome coupons — issued automatically the moment someone signs up, to
 // give them a reason to create an account instead of checking out as a
@@ -284,6 +395,23 @@ const WELCOME_COUPON_TIERS = [
   { tier: 'tier2', min_spend: 2000, discount_amount: 300 },
   { tier: 'tier3', min_spend: 3000, discount_amount: 600 },
 ];
+
+// ------------------------------------------------------------
+// Membership / store-credit (points) — a customer buys a "TUPS Membership"
+// cart item (added on index.html, one of the two tiers below) and gets that
+// tier's `points` credited as store credit once the order actually
+// succeeds. Credit is valid for MEMBERSHIP_POINTS_EXPIRY_DAYS from the
+// purchase date (tracked per-batch in points_ledger — see
+// computeValidPointsBalance() above), and can be applied at checkout (full
+// or partial, toward ANY product) to reduce a later order's total — see
+// processPointsForOrder() and the pointsUsedSatang handling in /charge +
+// /promptpay-charge.
+// ------------------------------------------------------------
+const MEMBERSHIP_TIERS = [
+  { price: 10000, points: 12000 },
+  { price: 20000, points: 26000 },
+];
+const MEMBERSHIP_POINTS_EXPIRY_DAYS = 365;
 
 async function issueWelcomeCoupons(email) {
   try {
@@ -341,15 +469,48 @@ async function markCouponUsed(couponId, charge, discountAmount) {
   }
 }
 
+// Server-side sanity check for "pointsUsedSatang" coming from the frontend,
+// called before a charge/source is ever created. The frontend already
+// computes the discounted amount client-side (same lightweight trust model
+// as coupons), but points are real money sitting in a member's balance, so
+// this refuses the request outright rather than silently charging less than
+// it should whenever the claimed amount doesn't fit the member's actual
+// balance (stale page, balance changed, or tampering).
+async function validatePointsUsage(memberEmail, pointsUsedSatang) {
+  const used = Number(pointsUsedSatang) || 0;
+  if (used <= 0) return { ok: true };
+  if (!memberEmail) return { ok: false, message: 'Store credit can only be used while logged in.' };
+  try {
+    const balanceThb = await computeValidPointsBalance(String(memberEmail).toLowerCase());
+    if (used > balanceThb * 100) {
+      return { ok: false, message: 'Your store credit balance has changed — please refresh and try again.' };
+    }
+    return { ok: true };
+  } catch (err) {
+    console.error('validatePointsUsage error:', err);
+    return { ok: false, message: 'Could not verify your store credit balance. Please try again.' };
+  }
+}
+
 // ------------------------------------------------------------
 // POST /charge  (card payments)
 // body: { omiseToken, amount, currency, customer: { name, phone, address }, items, returnUri, memberEmail }
 // ------------------------------------------------------------
 app.post('/charge', async (req, res) => {
-  const { omiseToken, amount, currency, customer, items, returnUri, memberEmail, couponId, subtotalSatang, discountSatang } = req.body;
+  const { omiseToken, amount, currency, customer, items, returnUri, memberEmail, couponId, subtotalSatang, discountSatang, pointsUsedSatang } = req.body;
 
   if (!omiseToken || !amount || !currency) {
     return res.status(400).json({ success: false, message: 'Missing required fields' });
+  }
+
+  // The frontend already subtracted any points the customer chose to apply
+  // before computing `amount` — but it's only trusted up to the member's
+  // ACTUAL current balance. If the two disagree (balance changed since page
+  // load, or the request was tampered with), reject rather than silently
+  // charging the lower, unverified amount.
+  const pointsCheck = await validatePointsUsage(memberEmail, pointsUsedSatang);
+  if (!pointsCheck.ok) {
+    return res.status(400).json({ success: false, message: pointsCheck.message });
   }
 
   try {
@@ -374,6 +535,7 @@ app.post('/charge', async (req, res) => {
         coupon_id: couponId ? String(couponId) : '',
         subtotal_satang: subtotalSatang || amount,
         discount_satang: discountSatang || 0,
+        points_used_satang: pointsUsedSatang || 0,
       },
     });
 
@@ -423,7 +585,7 @@ app.post('/charge', async (req, res) => {
 // response: { success, chargeId, status, qrImageBase64, expiresAt }
 // ------------------------------------------------------------
 app.post('/promptpay-charge', async (req, res) => {
-  const { amount, currency, customer, items, memberEmail, couponId, subtotalSatang, discountSatang } = req.body;
+  const { amount, currency, customer, items, memberEmail, couponId, subtotalSatang, discountSatang, pointsUsedSatang } = req.body;
 
   if (!amount || !currency) {
     return res.status(400).json({ success: false, message: 'Missing required fields' });
@@ -432,6 +594,11 @@ app.post('/promptpay-charge', async (req, res) => {
     // Omise requires >= 20 THB (2000 satang) for PromptPay in practice;
     // 100 satang (1 THB) is the hard floor we allow for test orders.
     return res.status(400).json({ success: false, message: 'Invalid amount' });
+  }
+
+  const pointsCheck = await validatePointsUsage(memberEmail, pointsUsedSatang);
+  if (!pointsCheck.ok) {
+    return res.status(400).json({ success: false, message: pointsCheck.message });
   }
 
   try {
@@ -458,6 +625,7 @@ app.post('/promptpay-charge', async (req, res) => {
         coupon_id: couponId ? String(couponId) : '',
         subtotal_satang: subtotalSatang || amount,
         discount_satang: discountSatang || 0,
+        points_used_satang: pointsUsedSatang || 0,
       },
     });
 
@@ -813,7 +981,7 @@ app.get('/my-orders', async (req, res) => {
   }
   try {
     const sbRes = await supabaseRequest(
-      `orders?member_email=eq.${encodeURIComponent(email)}&select=charge_id,order_number,payment_detail,items,amount,discount_amount,coupon_id,currency,payment_method,status,shipping_status,tracking_number,courier,refund_status,created_at&order=created_at.desc&limit=200`
+      `orders?member_email=eq.${encodeURIComponent(email)}&select=charge_id,order_number,payment_detail,items,amount,discount_amount,coupon_id,points_used,currency,payment_method,status,shipping_status,tracking_number,courier,refund_status,created_at&order=created_at.desc&limit=200`
     );
     if (!sbRes.ok) {
       console.error('My-orders fetch failed:', sbRes.status, await sbRes.text());
@@ -855,6 +1023,34 @@ app.get('/my-coupons', async (req, res) => {
     return res.json({ success: true, coupons: data });
   } catch (err) {
     console.error('My-coupons fetch error:', err);
+    return res.status(500).json({ success: false, message: 'Server error' });
+  }
+});
+
+// ------------------------------------------------------------
+// GET /my-points?email=...
+//
+// Returns one member's current store-credit (points) balance, in THB — shown
+// at checkout (so they can apply it toward an order) and on my-orders.html.
+// Same lightweight "just trust the stored email" check as /my-orders.
+// ------------------------------------------------------------
+app.get('/my-points', async (req, res) => {
+  const email = String(req.query.email || '').trim().toLowerCase();
+  if (!email) {
+    return res.status(400).json({ success: false, message: 'Email is required' });
+  }
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
+    return res.status(500).json({ success: false, message: 'Database is not configured yet' });
+  }
+  try {
+    const pointsBalance = await computeValidPointsBalance(email);
+    const historyRes = await supabaseRequest(
+      `points_ledger?member_email=eq.${encodeURIComponent(email)}&select=type,amount,tier,order_number,expires_at,created_at&order=created_at.desc&limit=100`
+    );
+    const history = historyRes.ok ? await historyRes.json() : [];
+    return res.json({ success: true, pointsBalance, history });
+  } catch (err) {
+    console.error('My-points fetch error:', err);
     return res.status(500).json({ success: false, message: 'Server error' });
   }
 });
