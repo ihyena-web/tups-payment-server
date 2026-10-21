@@ -511,8 +511,18 @@ async function markCouponUsed(couponId, charge, discountAmount) {
     if (!coupon || coupon.used) return;
     if (String(coupon.member_email || '').toLowerCase() !== memberEmail) return;
 
-    const subtotalSatang = Number(charge?.metadata?.subtotal_satang) || (charge.amount + discountAmount);
-    if (subtotalSatang < coupon.min_spend * 100) return; // threshold not actually met — skip, don't burn the coupon
+    // Eligibility is recomputed here from the order's own item list — NOT
+    // trusted from the client-sent subtotal_satang — and deliberately
+    // excludes any membership item's price. A "TUPS Membership" purchase
+    // must never itself count toward unlocking a welcome coupon meant for
+    // real product spend (buying a ฿1,000+ membership shouldn't "pay for"
+    // a coupon tier on its own).
+    let items = [];
+    try { items = JSON.parse(charge?.metadata?.items_json || '[]'); } catch (e) { items = []; }
+    const nonMembershipSubtotalSatang = (Array.isArray(items) ? items : [])
+      .filter(it => !(it && it.membership))
+      .reduce((sum, it) => sum + (Number(it.price) || 0) * (Number(it.qty) || 0), 0) * 100;
+    if (nonMembershipSubtotalSatang < coupon.min_spend * 100) return; // threshold not actually met — skip, don't burn the coupon
 
     const patchRes = await supabaseRequest(`coupons?id=eq.${encodeURIComponent(couponId)}`, {
       method: 'PATCH',
