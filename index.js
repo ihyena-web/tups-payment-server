@@ -17,6 +17,10 @@
 //   POST /promptpay-charge       — creates a PromptPay source + charge for the
 //                                   EXACT order amount, and returns the QR
 //                                   code image (embedded as base64)
+//   POST /zero-amount-order      — order total fully covered by a coupon +
+//                                   store credit (nothing left for Omise to
+//                                   charge) — records the order as paid and
+//                                   debits the points, no card/PromptPay
 //   GET  /charge-status/:id      — poll this until status is "successful"
 //                                   (paid=true) to confirm the exact amount
 //                                   was actually received before telling the
@@ -155,6 +159,10 @@ function makeOrderNumber(chargeId, createdAt) {
 // A short, human-readable description of how an order was paid — shown to
 // the customer when they tap their order number on my-orders.html.
 function makePaymentDetail(charge) {
+  // A real Omise charge is never ฿0 — this only happens for the synthetic
+  // "charge" object /zero-amount-order builds when store credit covers an
+  // order in full (see that endpoint below).
+  if (charge && charge.amount === 0 && charge.id && charge.id.startsWith('ptsord_')) return 'Store Credit';
   if (charge?.card) {
     const brand = charge.card.brand ? charge.card.brand[0].toUpperCase() + charge.card.brand.slice(1) : 'Card';
     return charge.card.last_digits ? `${brand} •••• ${charge.card.last_digits}` : brand;
@@ -175,7 +183,9 @@ async function saveOrderFromCharge(charge) {
   try {
     let items = [];
     try { items = JSON.parse(charge?.metadata?.items_json || '[]'); } catch (e) { items = []; }
-    const paymentMethod = charge?.card ? 'card' : (charge?.source && charge.source.type) || 'unknown';
+    const paymentMethod = (charge?.id && charge.id.startsWith('ptsord_'))
+      ? 'store_credit'
+      : charge?.card ? 'card' : (charge?.source && charge.source.type) || 'unknown';
     const discountAmount = Number(charge?.metadata?.discount_satang) || 0;
     const couponId = charge?.metadata?.coupon_id || null;
     const pointsUsedAmount = Number(charge?.metadata?.points_used_satang) || 0;
@@ -674,6 +684,78 @@ app.post('/promptpay-charge', async (req, res) => {
       success: false,
       message: err?.message || 'Server error while creating PromptPay charge',
     });
+  }
+});
+
+// ------------------------------------------------------------
+// POST /zero-amount-order
+//
+// When a coupon + store credit cover an order's ENTIRE total, there's
+// literally nothing left to charge — and Omise has no way to create a ฿0
+// charge, so /charge and /promptpay-charge can't be used for this case at
+// all. This endpoint exists for exactly that: no card token, no PromptPay
+// source, just a synthetic "charge" object (id prefixed ptsord_, amount 0,
+// status already "successful") fed straight into saveOrderFromCharge() —
+// the very same function every real charge goes through — so the order
+// still gets written to `orders`, the coupon still gets marked used, the
+// admin still gets notified, and the store credit still gets correctly
+// debited by processPointsForOrder(), all without duplicating any of that
+// logic here.
+//
+// body: { customer, items, memberEmail, couponId, subtotalSatang,
+//         discountSatang, pointsUsedSatang }
+// ------------------------------------------------------------
+app.post('/zero-amount-order', async (req, res) => {
+  const { customer, items, memberEmail, couponId, subtotalSatang, discountSatang, pointsUsedSatang } = req.body;
+
+  const subtotal = Number(subtotalSatang) || 0;
+  const discount = Number(discountSatang) || 0;
+  const pointsUsed = Number(pointsUsedSatang) || 0;
+  const finalAmount = subtotal - discount - pointsUsed;
+
+  if (pointsUsed <= 0) {
+    return res.status(400).json({ success: false, message: 'No store credit was applied to this order.' });
+  }
+  if (finalAmount !== 0) {
+    // Not actually fully covered — the frontend should have used /charge or
+    // /promptpay-charge instead. Refuse rather than silently recording an
+    // order for less than what's actually owed.
+    return res.status(400).json({ success: false, message: 'This order is not fully covered by store credit.' });
+  }
+
+  const pointsCheck = await validatePointsUsage(memberEmail, pointsUsed);
+  if (!pointsCheck.ok) {
+    return res.status(400).json({ success: false, message: pointsCheck.message });
+  }
+
+  try {
+    const chargeId = 'ptsord_' + crypto.randomBytes(12).toString('hex');
+    const fakeCharge = {
+      id: chargeId,
+      amount: 0,
+      currency: 'thb',
+      status: 'successful',
+      created_at: new Date().toISOString(),
+      card: null,
+      source: null,
+      metadata: {
+        customer_name: customer?.name || '',
+        customer_phone: customer?.phone || '',
+        shipping_address: customer?.address || '',
+        items_json: JSON.stringify(items || []),
+        member_email: memberEmail || '',
+        coupon_id: couponId ? String(couponId) : '',
+        subtotal_satang: subtotal,
+        discount_satang: discount,
+        points_used_satang: pointsUsed,
+      },
+    };
+
+    await saveOrderFromCharge(fakeCharge);
+    return res.json({ success: true, chargeId });
+  } catch (err) {
+    console.error('Zero-amount order error:', err);
+    return res.status(500).json({ success: false, message: 'Server error while processing this order' });
   }
 });
 
