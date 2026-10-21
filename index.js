@@ -534,9 +534,17 @@ async function markCouponUsed(couponId, charge, discountAmount) {
 // this refuses the request outright rather than silently charging less than
 // it should whenever the claimed amount doesn't fit the member's actual
 // balance (stale page, balance changed, or tampering).
-async function validatePointsUsage(memberEmail, pointsUsedSatang) {
+async function validatePointsUsage(memberEmail, pointsUsedSatang, items) {
   const used = Number(pointsUsedSatang) || 0;
   if (used <= 0) return { ok: true };
+  // Store credit can never be spent on a membership purchase itself —
+  // otherwise bonus points would effectively be discounting (or even fully
+  // funding) the very purchase that grants MORE bonus points, which isn't a
+  // real sale at all. Coupons are still fine on a membership order; only
+  // points are blocked, and only when a membership item is in the cart.
+  if (Array.isArray(items) && items.some(it => it && it.membership)) {
+    return { ok: false, message: 'Store credit cannot be used toward a membership purchase.' };
+  }
   if (!memberEmail) return { ok: false, message: 'Store credit can only be used while logged in.' };
   try {
     const balanceThb = await computeValidPointsBalance(String(memberEmail).toLowerCase());
@@ -566,7 +574,7 @@ app.post('/charge', async (req, res) => {
   // ACTUAL current balance. If the two disagree (balance changed since page
   // load, or the request was tampered with), reject rather than silently
   // charging the lower, unverified amount.
-  const pointsCheck = await validatePointsUsage(memberEmail, pointsUsedSatang);
+  const pointsCheck = await validatePointsUsage(memberEmail, pointsUsedSatang, items);
   if (!pointsCheck.ok) {
     return res.status(400).json({ success: false, message: pointsCheck.message });
   }
@@ -654,7 +662,7 @@ app.post('/promptpay-charge', async (req, res) => {
     return res.status(400).json({ success: false, message: 'Invalid amount' });
   }
 
-  const pointsCheck = await validatePointsUsage(memberEmail, pointsUsedSatang);
+  const pointsCheck = await validatePointsUsage(memberEmail, pointsUsedSatang, items);
   if (!pointsCheck.ok) {
     return res.status(400).json({ success: false, message: pointsCheck.message });
   }
@@ -765,7 +773,7 @@ app.post('/zero-amount-order', async (req, res) => {
     return res.status(400).json({ success: false, message: 'This order is not fully covered by store credit.' });
   }
 
-  const pointsCheck = await validatePointsUsage(memberEmail, pointsUsed);
+  const pointsCheck = await validatePointsUsage(memberEmail, pointsUsed, items);
   if (!pointsCheck.ok) {
     return res.status(400).json({ success: false, message: pointsCheck.message });
   }
