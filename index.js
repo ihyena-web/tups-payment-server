@@ -398,7 +398,7 @@ const WELCOME_COUPON_TIERS = [
 
 // ------------------------------------------------------------
 // Membership / store-credit (points) — a customer buys a "TUPS Membership"
-// cart item (added on index.html, one of the two tiers below) and gets that
+// cart item (added on index.html, one of the tiers below) and gets that
 // tier's `points` credited as store credit once the order actually
 // succeeds. Credit is valid for MEMBERSHIP_POINTS_EXPIRY_DAYS from the
 // purchase date (tracked per-batch in points_ledger — see
@@ -406,10 +406,16 @@ const WELCOME_COUPON_TIERS = [
 // or partial, toward ANY product) to reduce a later order's total — see
 // processPointsForOrder() and the pointsUsedSatang handling in /charge +
 // /promptpay-charge.
+//
+// The { price: 1000, points: 1200 } entry is a cheap TEST tier so the whole
+// flow (buy → credit → spend) can be tried end-to-end for real money
+// without risking a big amount. Remove this line once testing is done —
+// index.html has a matching test card to remove alongside it.
 // ------------------------------------------------------------
 const MEMBERSHIP_TIERS = [
   { price: 10000, points: 12000 },
   { price: 20000, points: 26000 },
+  { price: 1000, points: 1200 }, // TEST TIER — remove when done testing
 ];
 const MEMBERSHIP_POINTS_EXPIRY_DAYS = 365;
 
