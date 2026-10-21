@@ -325,6 +325,48 @@ async function computeValidPointsBalance(memberEmail) {
   return batches.reduce((sum, b) => sum + (b.expiresAtMs === null || b.expiresAtMs > now ? b.remaining : 0), 0);
 }
 
+// Same chronological FIFO replay as computeValidPointsBalance() above, but
+// returns the original vs. still-remaining amount for ONE specific credit
+// batch (identified by the charge_id of the membership purchase that
+// created it) — used by the cancel-order endpoint to decide whether a
+// membership purchase is still safe to cancel.
+//
+// Why "remaining === original" safely proves nothing has touched this
+// batch: debits are always drained against batches in creation order,
+// starting from the very first one, and a later batch only starts getting
+// drained once every batch before it has hit zero. So if THIS batch still
+// shows its full original amount, every batch created before it must
+// already be fully drained — nothing has reached this one yet, and nothing
+// after it could have been touched either. That's what makes it safe to
+// reverse later (see reverseMembershipCredit() at the /cancel endpoint)
+// without that reversal accidentally eating into some other, unrelated
+// credit batch.
+async function getCreditBatchStatus(memberEmail, chargeId) {
+  const res = await supabaseRequest(
+    `points_ledger?member_email=eq.${encodeURIComponent(memberEmail)}&select=type,charge_id,amount,created_at&order=created_at.asc`
+  );
+  if (!res.ok) return null;
+  const rows = await res.json();
+  const batches = []; // { chargeId, remaining, original }
+  for (const r of rows) {
+    if (r.type === 'credit') {
+      const amt = Number(r.amount) || 0;
+      batches.push({ chargeId: r.charge_id, remaining: amt, original: amt });
+    } else if (r.type === 'debit') {
+      let toConsume = Number(r.amount) || 0;
+      for (const b of batches) {
+        if (toConsume <= 0) break;
+        const take = Math.min(b.remaining, toConsume);
+        b.remaining -= take;
+        toConsume -= take;
+      }
+    }
+  }
+  const match = batches.find(b => b.chargeId === chargeId);
+  if (!match) return null;
+  return { original: match.original, remaining: match.remaining };
+}
+
 // Credits membership purchases and debits any store credit the customer
 // applied at checkout — exactly once per charge, no matter how many times
 // saveOrderFromCharge() gets called for it (creation, 3DS return, PromptPay
@@ -1206,6 +1248,48 @@ app.post('/my-orders/:chargeId/cancel', async (req, res) => {
       });
     }
 
+    // Fraud guard: if this order was a "TUPS Membership" purchase, cancelling
+    // (and refunding the card) would otherwise let a customer spend the
+    // store credit it granted on real products and THEN cancel the
+    // membership for a full refund — keeping both the products and the
+    // money. So a membership purchase can only be cancelled while its
+    // credit is still 100% untouched; once even ฿1 of it has been spent,
+    // it's locked and can no longer be cancelled here.
+    const isMembershipOrder = Array.isArray(order.items) && order.items.some(it => it && it.membership);
+    let creditBatch = null;
+    if (isMembershipOrder && order.member_email) {
+      creditBatch = await getCreditBatchStatus(order.member_email, chargeId);
+      if (creditBatch && creditBatch.remaining < creditBatch.original) {
+        return res.status(400).json({
+          success: false,
+          message: "This membership's store credit has already been used and can no longer be cancelled.",
+        });
+      }
+    }
+
+    // Reverses a still-untouched membership credit batch before/alongside
+    // the refund below — otherwise a cancelled-and-refunded membership
+    // would still leave its full credit sitting in the member's balance.
+    async function reverseMembershipCredit() {
+      if (!creditBatch || creditBatch.remaining <= 0) return;
+      const reverseRes = await supabaseRequest('points_ledger', {
+        method: 'POST',
+        headers: { Prefer: 'return=minimal,resolution=ignore-duplicates' },
+        body: JSON.stringify({
+          member_email: order.member_email,
+          charge_id: chargeId,
+          order_number: order.order_number,
+          type: 'debit',
+          amount: creditBatch.remaining,
+          tier: null,
+          expires_at: null,
+        }),
+      });
+      if (!reverseRes.ok) {
+        console.error('Membership credit reversal failed:', reverseRes.status, await reverseRes.text());
+      }
+    }
+
     if (order.payment_method === 'card') {
       // Real Omise refund — this is the part that actually reverses the
       // card charge and returns the money to the customer's card.
@@ -1216,6 +1300,7 @@ app.post('/my-orders/:chargeId/cancel', async (req, res) => {
       // consistent (it should come back as "reversed").
       const charge = await omise.charges.retrieve(chargeId);
       await saveOrderFromCharge(charge);
+      await reverseMembershipCredit();
 
       await supabaseRequest(`orders?charge_id=eq.${encodeURIComponent(chargeId)}`, {
         method: 'PATCH',
@@ -1228,6 +1313,7 @@ app.post('/my-orders/:chargeId/cancel', async (req, res) => {
 
     // Non-card (PromptPay, etc.) — Omise can't refund this for us, so we
     // only stop fulfillment here and flag it for a manual bank transfer.
+    await reverseMembershipCredit();
     await supabaseRequest(`orders?charge_id=eq.${encodeURIComponent(chargeId)}`, {
       method: 'PATCH',
       headers: { Prefer: 'return=minimal' },
