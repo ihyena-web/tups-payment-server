@@ -189,6 +189,8 @@ async function saveOrderFromCharge(charge) {
     const discountAmount = Number(charge?.metadata?.discount_satang) || 0;
     const couponId = charge?.metadata?.coupon_id || null;
     const pointsUsedAmount = Number(charge?.metadata?.points_used_satang) || 0;
+    const promoCode = charge?.metadata?.promo_code || null;
+    const promoDiscountAmount = Number(charge?.metadata?.promo_discount_satang) || 0;
     const row = {
       charge_id: charge.id,
       order_number: makeOrderNumber(charge.id, charge.created_at),
@@ -202,6 +204,8 @@ async function saveOrderFromCharge(charge) {
       discount_amount: discountAmount,
       coupon_id: couponId,
       points_used: pointsUsedAmount,
+      promo_code: promoCode,
+      promo_discount_amount: promoDiscountAmount,
       currency: charge.currency,
       payment_method: paymentMethod,
       status: charge.status,
@@ -243,6 +247,9 @@ async function saveOrderFromCharge(charge) {
     // burned on an attempt that never actually completed.
     if (couponId && charge.status === 'successful') {
       await markCouponUsed(couponId, charge, discountAmount);
+    }
+    if (promoCode && charge.status === 'successful') {
+      await redeemPromoCodeForOrder(row, charge);
     }
 
     // New-order admin notification — only the first time this charge turns
@@ -494,6 +501,16 @@ async function issueWelcomeCoupons(email) {
 // trust model as the rest of this lightweight server), so it just makes sure
 // a coupon can't silently get marked used twice or credited to the wrong
 // order.
+// Shared by coupons and promo codes: the cart total that's actually eligible
+// for a discount, excluding any "TUPS Membership" item's own price. Neither
+// a welcome coupon nor a promo code is allowed to discount a membership
+// purchase itself — only genuine product spend counts.
+function nonMembershipSubtotalSatangFromItems(items) {
+  return (Array.isArray(items) ? items : [])
+    .filter(it => !(it && it.membership))
+    .reduce((sum, it) => sum + (Number(it.price) || 0) * (Number(it.qty) || 0), 0) * 100;
+}
+
 async function markCouponUsed(couponId, charge, discountAmount) {
   try {
     const memberEmail = (charge?.metadata?.member_email || '').toLowerCase();
@@ -513,9 +530,7 @@ async function markCouponUsed(couponId, charge, discountAmount) {
     // a coupon tier on its own).
     let items = [];
     try { items = JSON.parse(charge?.metadata?.items_json || '[]'); } catch (e) { items = []; }
-    const nonMembershipSubtotalSatang = (Array.isArray(items) ? items : [])
-      .filter(it => !(it && it.membership))
-      .reduce((sum, it) => sum + (Number(it.price) || 0) * (Number(it.qty) || 0), 0) * 100;
+    const nonMembershipSubtotalSatang = nonMembershipSubtotalSatangFromItems(items);
     if (nonMembershipSubtotalSatang < coupon.min_spend * 100) return; // threshold not actually met — skip, don't burn the coupon
 
     const patchRes = await supabaseRequest(`coupons?id=eq.${encodeURIComponent(couponId)}`, {
@@ -528,6 +543,131 @@ async function markCouponUsed(couponId, charge, discountAmount) {
     }
   } catch (err) {
     console.error('Coupon mark-used error:', err);
+  }
+}
+
+// ------------------------------------------------------------
+// Promo codes — a separate, admin-created set of discount codes (see
+// /admin/promo-codes below), distinct from the automatic welcome coupons.
+// A code can be a fixed ฿ amount or a percentage (optionally capped), is
+// reusable up to an admin-set max_uses (or unlimited), and — like welcome
+// coupons — can never discount a "TUPS Membership" item's own price: the
+// discount is computed from, and capped at, the cart's non-membership
+// subtotal only.
+// ------------------------------------------------------------
+
+// Looks up a code and, if it's currently usable against this item list,
+// returns the discount it earns. Used both by /validate-promo-code (so
+// checkout can show the discount before charging) and again when an order
+// actually succeeds (so we don't trust the frontend's claimed discount any
+// more than we trust a coupon's).
+async function evaluatePromoCode(code, items) {
+  const normalized = String(code || '').trim().toUpperCase();
+  if (!normalized) return { ok: false, message: 'Please enter a promo code.' };
+  const getRes = await supabaseRequest(`promo_codes?code=eq.${encodeURIComponent(normalized)}&select=*`);
+  if (!getRes.ok) return { ok: false, message: 'Could not check that code right now. Please try again.' };
+  const rows = await getRes.json();
+  const promo = rows && rows[0];
+  if (!promo || !promo.active) {
+    return { ok: false, message: 'This promo code is not valid.' };
+  }
+  if (promo.max_uses !== null && promo.max_uses !== undefined && promo.used_count >= promo.max_uses) {
+    return { ok: false, message: 'This promo code has reached its usage limit.' };
+  }
+  const nonMembershipSubtotalSatang = nonMembershipSubtotalSatangFromItems(items);
+  if (nonMembershipSubtotalSatang < (Number(promo.min_spend) || 0) * 100) {
+    return { ok: false, message: `Spend at least ฿${Number(promo.min_spend || 0).toLocaleString()} (excluding any membership) to use this code.` };
+  }
+  if (nonMembershipSubtotalSatang <= 0) {
+    return { ok: false, message: 'This code can only be used on regular products, not a membership purchase alone.' };
+  }
+  let discountSatang;
+  if (promo.discount_type === 'percent') {
+    discountSatang = Math.round(nonMembershipSubtotalSatang * (Number(promo.discount_value) || 0) / 100);
+    if (promo.max_discount_thb) discountSatang = Math.min(discountSatang, Math.round(Number(promo.max_discount_thb) * 100));
+  } else {
+    discountSatang = Math.round((Number(promo.discount_value) || 0) * 100);
+  }
+  // Never lets the discount exceed the non-membership subtotal itself — a
+  // promo code can only ever discount regular products, never eat into a
+  // membership item's price.
+  discountSatang = Math.max(0, Math.min(discountSatang, nonMembershipSubtotalSatang));
+  return { ok: true, promo, discountSatang };
+}
+
+// Counts one redemption against a promo code's used_count — exactly once
+// per charge, no matter how many times saveOrderFromCharge() re-runs for it
+// (creation, 3DS return, PromptPay poll), via the same insert-with-a-unique-
+// constraint-and-check-what-came-back trick processPointsForOrder() uses
+// above: promo_code_redemptions.charge_id is UNIQUE, so a repeat insert for
+// the same charge is silently ignored, and return=representation tells us
+// whether THIS call was the one that actually created the row.
+async function redeemPromoCodeForOrder(row, charge) {
+  const code = (charge?.metadata?.promo_code || '').trim();
+  if (!code) return;
+  try {
+    const result = await evaluatePromoCode(code, row.items);
+    if (!result.ok) return; // no longer valid — the discount already charged stands, but don't count it against the limit
+    const promo = result.promo;
+
+    const insertRes = await supabaseRequest('promo_code_redemptions', {
+      method: 'POST',
+      headers: { Prefer: 'return=representation,resolution=ignore-duplicates' },
+      body: JSON.stringify([{ promo_code_id: promo.id, charge_id: charge.id }]),
+    });
+    if (!insertRes.ok) {
+      console.error('Promo code redemption insert failed:', insertRes.status, await insertRes.text());
+      return;
+    }
+    const inserted = await insertRes.json();
+    if (!Array.isArray(inserted) || inserted.length === 0) return; // already redeemed for this charge — don't double-count
+
+    const patchRes = await supabaseRequest(`promo_codes?id=eq.${encodeURIComponent(promo.id)}`, {
+      method: 'PATCH',
+      headers: { Prefer: 'return=minimal' },
+      body: JSON.stringify({ used_count: (Number(promo.used_count) || 0) + 1 }),
+    });
+    if (!patchRes.ok) {
+      console.error('Promo code used_count update failed:', patchRes.status, await patchRes.text());
+    }
+  } catch (err) {
+    console.error('redeemPromoCodeForOrder error:', err);
+  }
+}
+
+// Reverses a promo-code redemption when its order gets cancelled — gives
+// the code back its use, same philosophy as reversing points/coupons on
+// cancellation elsewhere in this file. Deletes the redemption row (if one
+// exists for this charge) and decrements used_count, clamped at 0.
+async function reversePromoCodeRedemption(chargeId) {
+  try {
+    const getRes = await supabaseRequest(`promo_code_redemptions?charge_id=eq.${encodeURIComponent(chargeId)}&select=id,promo_code_id`);
+    if (!getRes.ok) return;
+    const rows = await getRes.json();
+    const redemption = rows && rows[0];
+    if (!redemption) return;
+
+    const delRes = await supabaseRequest(`promo_code_redemptions?id=eq.${encodeURIComponent(redemption.id)}`, {
+      method: 'DELETE',
+      headers: { Prefer: 'return=minimal' },
+    });
+    if (!delRes.ok) {
+      console.error('Promo code redemption delete failed:', delRes.status, await delRes.text());
+      return;
+    }
+
+    const promoRes = await supabaseRequest(`promo_codes?id=eq.${encodeURIComponent(redemption.promo_code_id)}&select=used_count`);
+    if (!promoRes.ok) return;
+    const promos = await promoRes.json();
+    const promo = promos && promos[0];
+    if (!promo) return;
+    await supabaseRequest(`promo_codes?id=eq.${encodeURIComponent(redemption.promo_code_id)}`, {
+      method: 'PATCH',
+      headers: { Prefer: 'return=minimal' },
+      body: JSON.stringify({ used_count: Math.max(0, (Number(promo.used_count) || 0) - 1) }),
+    });
+  } catch (err) {
+    console.error('reversePromoCodeRedemption error:', err);
   }
 }
 
@@ -567,7 +707,7 @@ async function validatePointsUsage(memberEmail, pointsUsedSatang, items) {
 // body: { omiseToken, amount, currency, customer: { name, phone, address }, items, returnUri, memberEmail }
 // ------------------------------------------------------------
 app.post('/charge', async (req, res) => {
-  const { omiseToken, amount, currency, customer, items, returnUri, memberEmail, couponId, subtotalSatang, discountSatang, pointsUsedSatang } = req.body;
+  const { omiseToken, amount, currency, customer, items, returnUri, memberEmail, couponId, subtotalSatang, discountSatang, pointsUsedSatang, promoCode, promoDiscountSatang } = req.body;
 
   if (!omiseToken || !amount || !currency) {
     return res.status(400).json({ success: false, message: 'Missing required fields' });
@@ -606,6 +746,8 @@ app.post('/charge', async (req, res) => {
         subtotal_satang: subtotalSatang || amount,
         discount_satang: discountSatang || 0,
         points_used_satang: pointsUsedSatang || 0,
+        promo_code: promoCode ? String(promoCode).trim().toUpperCase() : '',
+        promo_discount_satang: promoDiscountSatang || 0,
       },
     });
 
@@ -655,7 +797,7 @@ app.post('/charge', async (req, res) => {
 // response: { success, chargeId, status, qrImageBase64, expiresAt }
 // ------------------------------------------------------------
 app.post('/promptpay-charge', async (req, res) => {
-  const { amount, currency, customer, items, memberEmail, couponId, subtotalSatang, discountSatang, pointsUsedSatang } = req.body;
+  const { amount, currency, customer, items, memberEmail, couponId, subtotalSatang, discountSatang, pointsUsedSatang, promoCode, promoDiscountSatang } = req.body;
 
   if (!amount || !currency) {
     return res.status(400).json({ success: false, message: 'Missing required fields' });
@@ -696,6 +838,8 @@ app.post('/promptpay-charge', async (req, res) => {
         subtotal_satang: subtotalSatang || amount,
         discount_satang: discountSatang || 0,
         points_used_satang: pointsUsedSatang || 0,
+        promo_code: promoCode ? String(promoCode).trim().toUpperCase() : '',
+        promo_discount_satang: promoDiscountSatang || 0,
       },
     });
 
@@ -760,12 +904,13 @@ app.post('/promptpay-charge', async (req, res) => {
 //         discountSatang, pointsUsedSatang }
 // ------------------------------------------------------------
 app.post('/zero-amount-order', async (req, res) => {
-  const { customer, items, memberEmail, couponId, subtotalSatang, discountSatang, pointsUsedSatang } = req.body;
+  const { customer, items, memberEmail, couponId, subtotalSatang, discountSatang, pointsUsedSatang, promoCode, promoDiscountSatang } = req.body;
 
   const subtotal = Number(subtotalSatang) || 0;
   const discount = Number(discountSatang) || 0;
   const pointsUsed = Number(pointsUsedSatang) || 0;
-  const finalAmount = subtotal - discount - pointsUsed;
+  const promoDiscount = Number(promoDiscountSatang) || 0;
+  const finalAmount = subtotal - discount - promoDiscount - pointsUsed;
 
   if (pointsUsed <= 0) {
     return res.status(400).json({ success: false, message: 'No store credit was applied to this order.' });
@@ -802,6 +947,8 @@ app.post('/zero-amount-order', async (req, res) => {
         subtotal_satang: subtotal,
         discount_satang: discount,
         points_used_satang: pointsUsed,
+        promo_code: promoCode ? String(promoCode).trim().toUpperCase() : '',
+        promo_discount_satang: promoDiscount,
       },
     };
 
@@ -1198,6 +1345,46 @@ app.get('/my-points', async (req, res) => {
 });
 
 // ------------------------------------------------------------
+// POST /validate-promo-code
+// body: { code, items }
+//
+// Lets checkout preview a promo code's discount BEFORE actually charging —
+// re-uses the exact same evaluatePromoCode() logic that redeemPromoCodeForOrder()
+// runs again (server-side, trusted) once the charge actually succeeds, so
+// what the customer sees here is guaranteed to match what they're charged.
+// Never trusts a client-sent subtotal: discount is always computed from the
+// server's own read of `items` (same non-membership-subtotal rule as coupons).
+// ------------------------------------------------------------
+app.post('/validate-promo-code', async (req, res) => {
+  const { code, items } = req.body || {};
+  if (!code || !String(code).trim()) {
+    return res.status(400).json({ success: false, message: 'Please enter a promo code.' });
+  }
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
+    return res.status(500).json({ success: false, message: 'Database is not configured yet' });
+  }
+  try {
+    const result = await evaluatePromoCode(code, items);
+    if (!result.ok) {
+      return res.json({ success: false, message: result.message });
+    }
+    return res.json({
+      success: true,
+      code: result.promo.code,
+      discountType: result.promo.discount_type,
+      discountValue: Number(result.promo.discount_value),
+      maxDiscountThb: (result.promo.max_discount_thb === null || result.promo.max_discount_thb === undefined) ? null : Number(result.promo.max_discount_thb),
+      minSpend: Number(result.promo.min_spend) || 0,
+      discountSatang: result.discountSatang,
+      discountThb: Math.round(result.discountSatang / 100),
+    });
+  } catch (err) {
+    console.error('Validate-promo-code error:', err);
+    return res.status(500).json({ success: false, message: 'Server error' });
+  }
+});
+
+// ------------------------------------------------------------
 // POST /my-orders/:chargeId/cancel
 // body: { email }
 //
@@ -1349,6 +1536,7 @@ app.post('/my-orders/:chargeId/cancel', async (req, res) => {
       await saveOrderFromCharge(charge);
       await reversePointsLedgerForCharge();
       await reverseCouponForOrder();
+      await reversePromoCodeRedemption(chargeId);
 
       await supabaseRequest(`orders?charge_id=eq.${encodeURIComponent(chargeId)}`, {
         method: 'PATCH',
@@ -1366,6 +1554,7 @@ app.post('/my-orders/:chargeId/cancel', async (req, res) => {
     // immediately rather than left pending.
     await reversePointsLedgerForCharge();
     await reverseCouponForOrder();
+    await reversePromoCodeRedemption(chargeId);
     const isStoreCreditOrder = order.payment_method === 'store_credit';
     await supabaseRequest(`orders?charge_id=eq.${encodeURIComponent(chargeId)}`, {
       method: 'PATCH',
@@ -1483,6 +1672,127 @@ app.get('/admin/members', async (req, res) => {
     return res.json({ success: true, members: data });
   } catch (err) {
     console.error('Admin members fetch error:', err);
+    return res.status(500).json({ success: false, message: 'Server error' });
+  }
+});
+
+// ------------------------------------------------------------
+// /admin/promo-codes — CRUD for admin-created promo codes.
+//
+// code is always stored upper-cased (matches evaluatePromoCode's own
+// normalization, so lookups at checkout always match regardless of how the
+// admin typed it in). discount_type is 'fixed' (THB off) or 'percent' (% off,
+// optionally capped by max_discount_thb). max_uses is nullable = unlimited.
+// Promo codes never apply to membership purchases — that's enforced in
+// evaluatePromoCode() itself (capped to the non-membership subtotal), not
+// here; this is just the management surface.
+// ------------------------------------------------------------
+app.get('/admin/promo-codes', async (req, res) => {
+  if (!requireAdminKey(req, res)) return;
+  try {
+    const sbRes = await supabaseRequest('promo_codes?select=*&order=created_at.desc');
+    if (!sbRes.ok) {
+      console.error('Admin promo-codes fetch failed:', sbRes.status, await sbRes.text());
+      return res.status(500).json({ success: false, message: 'Server error' });
+    }
+    const data = await sbRes.json();
+    return res.json({ success: true, promoCodes: data });
+  } catch (err) {
+    console.error('Admin promo-codes fetch error:', err);
+    return res.status(500).json({ success: false, message: 'Server error' });
+  }
+});
+
+app.post('/admin/promo-codes', async (req, res) => {
+  if (!requireAdminKey(req, res)) return;
+  try {
+    const { code, discount_type, discount_value, max_discount_thb, min_spend, max_uses, active } = req.body || {};
+    const normalizedCode = String(code || '').trim().toUpperCase();
+    if (!normalizedCode) {
+      return res.status(400).json({ success: false, message: 'Code is required' });
+    }
+    if (discount_type !== 'fixed' && discount_type !== 'percent') {
+      return res.status(400).json({ success: false, message: "discount_type must be 'fixed' or 'percent'" });
+    }
+    if (!discount_value || Number(discount_value) <= 0) {
+      return res.status(400).json({ success: false, message: 'discount_value must be greater than 0' });
+    }
+    const insertRes = await supabaseRequest('promo_codes', {
+      method: 'POST',
+      headers: { Prefer: 'return=representation' },
+      body: JSON.stringify([{
+        code: normalizedCode,
+        discount_type,
+        discount_value: Number(discount_value),
+        max_discount_thb: (max_discount_thb !== undefined && max_discount_thb !== null && max_discount_thb !== '') ? Number(max_discount_thb) : null,
+        min_spend: Number(min_spend) || 0,
+        max_uses: (max_uses !== undefined && max_uses !== null && max_uses !== '') ? Number(max_uses) : null,
+        used_count: 0,
+        active: active === undefined ? true : !!active,
+      }]),
+    });
+    if (!insertRes.ok) {
+      const errText = await insertRes.text();
+      console.error('Admin promo-code create failed:', insertRes.status, errText);
+      if (errText.includes('duplicate key') || errText.includes('already exists')) {
+        return res.status(400).json({ success: false, message: 'That code already exists.' });
+      }
+      return res.status(500).json({ success: false, message: 'Server error' });
+    }
+    const created = await insertRes.json();
+    return res.json({ success: true, promoCode: created && created[0] });
+  } catch (err) {
+    console.error('Admin promo-code create error:', err);
+    return res.status(500).json({ success: false, message: 'Server error' });
+  }
+});
+
+app.patch('/admin/promo-codes/:id', async (req, res) => {
+  if (!requireAdminKey(req, res)) return;
+  try {
+    const { id } = req.params;
+    const allowedFields = ['discount_type', 'discount_value', 'max_discount_thb', 'min_spend', 'max_uses', 'active', 'code'];
+    const patch = {};
+    for (const field of allowedFields) {
+      if (Object.prototype.hasOwnProperty.call(req.body || {}, field)) {
+        patch[field] = field === 'code' ? String(req.body[field] || '').trim().toUpperCase() : req.body[field];
+      }
+    }
+    if (Object.keys(patch).length === 0) {
+      return res.status(400).json({ success: false, message: 'No fields to update' });
+    }
+    const patchRes = await supabaseRequest(`promo_codes?id=eq.${encodeURIComponent(id)}`, {
+      method: 'PATCH',
+      headers: { Prefer: 'return=representation' },
+      body: JSON.stringify(patch),
+    });
+    if (!patchRes.ok) {
+      console.error('Admin promo-code update failed:', patchRes.status, await patchRes.text());
+      return res.status(500).json({ success: false, message: 'Server error' });
+    }
+    const updated = await patchRes.json();
+    return res.json({ success: true, promoCode: updated && updated[0] });
+  } catch (err) {
+    console.error('Admin promo-code update error:', err);
+    return res.status(500).json({ success: false, message: 'Server error' });
+  }
+});
+
+app.delete('/admin/promo-codes/:id', async (req, res) => {
+  if (!requireAdminKey(req, res)) return;
+  try {
+    const { id } = req.params;
+    const delRes = await supabaseRequest(`promo_codes?id=eq.${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+      headers: { Prefer: 'return=minimal' },
+    });
+    if (!delRes.ok) {
+      console.error('Admin promo-code delete failed:', delRes.status, await delRes.text());
+      return res.status(500).json({ success: false, message: 'Server error' });
+    }
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('Admin promo-code delete error:', err);
     return res.status(500).json({ success: false, message: 'Server error' });
   }
 });
