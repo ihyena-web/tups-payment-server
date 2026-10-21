@@ -1285,26 +1285,33 @@ app.post('/my-orders/:chargeId/cancel', async (req, res) => {
       }
     }
 
-    // Reverses a still-untouched membership credit batch before/alongside
-    // the refund below — otherwise a cancelled-and-refunded membership
-    // would still leave its full credit sitting in the member's balance.
-    async function reverseMembershipCredit() {
-      if (!creditBatch || creditBatch.remaining <= 0) return;
-      const reverseRes = await supabaseRequest('points_ledger', {
-        method: 'POST',
-        headers: { Prefer: 'return=minimal,resolution=ignore-duplicates' },
-        body: JSON.stringify({
-          member_email: order.member_email,
-          charge_id: chargeId,
-          order_number: order.order_number,
-          type: 'debit',
-          amount: creditBatch.remaining,
-          tier: null,
-          expires_at: null,
-        }),
-      });
-      if (!reverseRes.ok) {
-        console.error('Membership credit reversal failed:', reverseRes.status, await reverseRes.text());
+    // Cancelling ANY order has to undo whatever that order's own charge did
+    // to the points_ledger — not just membership purchases. Two cases:
+    //   - a membership purchase ("credit" row) being cancelled must give
+    //     back the ฿ it cost AND take back the bonus points it granted
+    //     (guarded above: only reachable while that credit is untouched).
+    //   - a regular order that was paid for (in part) with store credit
+    //     ("debit" row) being cancelled must give that spent credit BACK
+    //     to the member's balance — otherwise cancelling a points-funded
+    //     order would permanently destroy those points for nothing.
+    // Since each charge writes at most one 'credit' row and one 'debit' row
+    // (unique(charge_id, type)), and computeValidPointsBalance()/
+    // getCreditBatchStatus() replay the whole ledger fresh every time
+    // rather than caching a balance, simply DELETING every points_ledger
+    // row tied to this charge_id correctly reverses either case (or both,
+    // in the unlikely event a single charge somehow had both) with no
+    // separate "give it back" bookkeeping needed.
+    async function reversePointsLedgerForCharge() {
+      try {
+        const delRes = await supabaseRequest(`points_ledger?charge_id=eq.${encodeURIComponent(chargeId)}`, {
+          method: 'DELETE',
+          headers: { Prefer: 'return=minimal' },
+        });
+        if (!delRes.ok) {
+          console.error('Points-ledger reversal failed for charge', chargeId, delRes.status, await delRes.text());
+        }
+      } catch (err) {
+        console.error('Points-ledger reversal error for charge', chargeId, err?.message || err);
       }
     }
 
@@ -1318,7 +1325,7 @@ app.post('/my-orders/:chargeId/cancel', async (req, res) => {
       // consistent (it should come back as "reversed").
       const charge = await omise.charges.retrieve(chargeId);
       await saveOrderFromCharge(charge);
-      await reverseMembershipCredit();
+      await reversePointsLedgerForCharge();
 
       await supabaseRequest(`orders?charge_id=eq.${encodeURIComponent(chargeId)}`, {
         method: 'PATCH',
@@ -1329,21 +1336,30 @@ app.post('/my-orders/:chargeId/cancel', async (req, res) => {
       return res.json({ success: true, manual: false, status: charge.status, refund_status: 'refunded' });
     }
 
-    // Non-card (PromptPay, etc.) — Omise can't refund this for us, so we
-    // only stop fulfillment here and flag it for a manual bank transfer.
-    await reverseMembershipCredit();
+    // Non-card: PromptPay can't be auto-refunded by Omise, so that still
+    // needs a manual bank transfer. A store-credit (zero-amount) order has
+    // no real money to refund in the first place — reversing the points
+    // above already makes the member whole, so that one is "refunded"
+    // immediately rather than left pending.
+    await reversePointsLedgerForCharge();
+    const isStoreCreditOrder = order.payment_method === 'store_credit';
     await supabaseRequest(`orders?charge_id=eq.${encodeURIComponent(chargeId)}`, {
       method: 'PATCH',
       headers: { Prefer: 'return=minimal' },
-      body: JSON.stringify({ shipping_status: 'cancelled', refund_status: 'pending_manual' }),
+      body: JSON.stringify({
+        shipping_status: 'cancelled',
+        refund_status: isStoreCreditOrder ? 'refunded' : 'pending_manual',
+      }),
     });
 
     return res.json({
       success: true,
-      manual: true,
+      manual: !isStoreCreditOrder,
       status: order.status,
-      refund_status: 'pending_manual',
-      message: 'Your cancellation request has been received. Since this order was paid via PromptPay, our team will transfer your refund manually within 1–3 business days.',
+      refund_status: isStoreCreditOrder ? 'refunded' : 'pending_manual',
+      message: isStoreCreditOrder
+        ? 'Your order has been cancelled and your store credit has been returned to your balance.'
+        : 'Your cancellation request has been received. Since this order was paid via PromptPay, our team will transfer your refund manually within 1–3 business days.',
     });
   } catch (err) {
     console.error('Cancel-order error:', err?.message || err);
