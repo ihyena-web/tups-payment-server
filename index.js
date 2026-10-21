@@ -67,14 +67,19 @@ const SITE_BASE_URL = 'https://lyvonthai.com';
 // fetch() instead of adding their SDK as a dependency.
 //
 // Required env vars on Render:
-//   RESEND_API_KEY    from resend.com → API Keys
-//   RESEND_FROM_EMAIL e.g. "LYVON x TUPS Thailand <no-reply@lyvonthai.com>" —
-//                     the sending address must be on a domain verified in
-//                     Resend (lyvonthai.com), or emails will fail to send to
-//                     anyone but your own Resend account email.
+//   RESEND_API_KEY     from resend.com → API Keys
+//   RESEND_FROM_EMAIL  e.g. "LYVON x TUPS Thailand <no-reply@lyvonthai.com>" —
+//                      the sending address must be on a domain verified in
+//                      Resend (lyvonthai.com), or emails will fail to send to
+//                      anyone but your own Resend account email.
+//   ADMIN_NOTIFY_EMAIL optional — where new-order notification emails go.
+//                      Defaults to info@lyvonthai.com if not set.
 // ------------------------------------------------------------
 const RESEND_API_KEY = process.env.RESEND_API_KEY;
 const RESEND_FROM_EMAIL = process.env.RESEND_FROM_EMAIL || 'LYVON x TUPS Thailand <onboarding@resend.dev>';
+// Where a "you've got a new order" email goes — override with the
+// ADMIN_NOTIFY_EMAIL env var on Render if that should be a different inbox.
+const ADMIN_NOTIFY_EMAIL = process.env.ADMIN_NOTIFY_EMAIL || 'info@lyvonthai.com';
 
 async function sendEmail({ to, subject, html }) {
   if (!RESEND_API_KEY) {
@@ -191,6 +196,22 @@ async function saveOrderFromCharge(charge) {
       // function gets from /charge-status polling. Omitting a key from this
       // upsert leaves whatever is already in that column untouched.
     };
+    // Checked BEFORE the upsert below, so we know whether this call is the
+    // moment the order actually first became "successful" — saveOrderFromCharge()
+    // gets called repeatedly (creation, 3DS return, PromptPay poll), and the
+    // admin notification email below must only fire once per order, not on
+    // every single one of those calls.
+    let previousStatus = null;
+    try {
+      const existingRes = await supabaseRequest(`orders?charge_id=eq.${encodeURIComponent(charge.id)}&select=status`);
+      if (existingRes.ok) {
+        const existingRows = await existingRes.json();
+        if (existingRows[0]) previousStatus = existingRows[0].status;
+      }
+    } catch (e) {
+      console.error('Order status lookup (for notify dedupe) failed:', e);
+    }
+
     const res = await supabaseRequest('orders?on_conflict=charge_id', {
       method: 'POST',
       headers: { Prefer: 'resolution=merge-duplicates,return=minimal' },
@@ -208,9 +229,46 @@ async function saveOrderFromCharge(charge) {
     if (couponId && charge.status === 'successful') {
       await markCouponUsed(couponId, charge, discountAmount);
     }
+
+    // New-order admin notification — only the first time this charge turns
+    // "successful", never on an earlier pending save or a later repeat poll.
+    if (charge.status === 'successful' && previousStatus !== 'successful') {
+      notifyAdminOfNewOrder(row).catch(err => console.error('Order notification email error:', err));
+    }
   } catch (err) {
     console.error('Supabase order save error:', err);
   }
+}
+
+// Sends the admin (ADMIN_NOTIFY_EMAIL above) a "you've got a new order" email
+// the moment a charge first turns "successful" — see the dedupe check at the
+// saveOrderFromCharge() call site, which only calls this once per order.
+async function notifyAdminOfNewOrder(row) {
+  const itemsHtml = Array.isArray(row.items) && row.items.length
+    ? row.items.map(it => `<li>${it.name || 'Item'} × ${it.qty || 1}</li>`).join('')
+    : '<li>(no item details)</li>';
+  const amountThb = (row.amount / 100).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const discountThb = row.discount_amount ? (row.discount_amount / 100).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : null;
+  await sendEmail({
+    to: ADMIN_NOTIFY_EMAIL,
+    subject: `New order — ${row.order_number} (฿${amountThb})`,
+    html: `
+      <div style="font-family:sans-serif; max-width:480px; margin:0 auto;">
+        <p>A new order just came in on lyvonthai.com.</p>
+        <p style="margin:18px 0;">
+          <b>Order #:</b> ${row.order_number}<br>
+          <b>Customer:</b> ${row.customer_name || '-'}<br>
+          <b>Phone:</b> ${row.customer_phone || '-'}<br>
+          <b>Shipping address:</b> ${row.shipping_address || '-'}<br>
+          <b>Amount:</b> ฿${amountThb} (${row.currency || 'THB'})${discountThb ? ` <span style="color:#6B6B6B;">(฿${discountThb} coupon discount applied)</span>` : ''}<br>
+          <b>Payment:</b> ${row.payment_detail || row.payment_method || '-'}
+        </p>
+        <p><b>Items:</b></p>
+        <ul>${itemsHtml}</ul>
+        <p style="margin-top:24px;"><a href="https://lyvonthai.com/admin.html" style="background:#111; color:#fff; padding:12px 22px; text-decoration:none; border-radius:2px; font-weight:600;">Open Admin</a></p>
+      </div>
+    `,
+  });
 }
 
 // ------------------------------------------------------------
