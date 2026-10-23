@@ -1552,16 +1552,32 @@ app.post('/my-orders/:chargeId/cancel', async (req, res) => {
     // no real money to refund in the first place — reversing the points
     // above already makes the member whole, so that one is "refunded"
     // immediately rather than left pending.
+    const isStoreCreditOrder = order.payment_method === 'store_credit';
+
+    // A real (PromptPay) refund needs somewhere to actually send the money,
+    // so we ask the customer for it right at cancel time instead of making
+    // an admin chase them down later. The frontend is expected to collect
+    // this via a modal and resend the cancel request with it filled in —
+    // signalled back here with needsRefundAccount so it knows to prompt.
+    const refundAccount = String(req.body.refundAccount || '').trim();
+    if (!isStoreCreditOrder && !refundAccount) {
+      return res.status(400).json({
+        success: false,
+        needsRefundAccount: true,
+        message: 'Please provide the PromptPay number or bank account you want your refund sent to.',
+      });
+    }
+
     await reversePointsLedgerForCharge();
     await reverseCouponForOrder();
     await reversePromoCodeRedemption(chargeId);
-    const isStoreCreditOrder = order.payment_method === 'store_credit';
     await supabaseRequest(`orders?charge_id=eq.${encodeURIComponent(chargeId)}`, {
       method: 'PATCH',
       headers: { Prefer: 'return=minimal' },
       body: JSON.stringify({
         shipping_status: 'cancelled',
         refund_status: isStoreCreditOrder ? 'refunded' : 'pending_manual',
+        refund_account: isStoreCreditOrder ? null : refundAccount,
       }),
     });
 
@@ -1572,7 +1588,7 @@ app.post('/my-orders/:chargeId/cancel', async (req, res) => {
       refund_status: isStoreCreditOrder ? 'refunded' : 'pending_manual',
       message: isStoreCreditOrder
         ? 'Your order has been cancelled and your store credit has been returned to your balance.'
-        : 'Your cancellation request has been received. Since this order was paid via PromptPay, our team will transfer your refund manually within 1–3 business days.',
+        : 'Your cancellation request has been received. Since this order was paid via PromptPay, our team will transfer your refund manually within 7–10 business days (working days).',
     });
   } catch (err) {
     console.error('Cancel-order error:', err?.message || err);
