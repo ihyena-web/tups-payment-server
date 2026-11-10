@@ -652,6 +652,23 @@ async function preflightOrder(body) {
   if (!promoCheck.ok) return promoCheck;
   const pointsCheck = await validatePointsUsage(body.memberEmail, body.pointsUsedSatang, items);
   if (!pointsCheck.ok) return pointsCheck;
+  // Store credit (membership points) can't pay for 1+1 items either — only
+  // for the other regular products, after their coupon / promo discount.
+  const pointsUsed = Number(body.pointsUsedSatang) || 0;
+  if (pointsUsed > 0) {
+    const pointsEligibleSatang = Math.max(0,
+      nonMembershipSubtotalSatangFromItems(items) - (Number(body.discountSatang) || 0) - (Number(body.promoDiscountSatang) || 0));
+    if (pointsUsed > pointsEligibleSatang) {
+      const hasBogo = items.some(it => it && it.bogo);
+      return {
+        ok: false,
+        reason: hasBogo ? 'points_bogo_excluded' : 'points_too_much',
+        message: hasBogo
+          ? "Store credit can't be used on 1+1 items — only on your other products."
+          : 'Store credit is more than the amount it can be used on. Please refresh and try again.',
+      };
+    }
+  }
   return { ok: true, items };
 }
 
