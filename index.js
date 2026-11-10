@@ -268,7 +268,7 @@ async function saveOrderFromCharge(charge) {
 // saveOrderFromCharge() call site, which only calls this once per order.
 async function notifyAdminOfNewOrder(row) {
   const itemsHtml = Array.isArray(row.items) && row.items.length
-    ? row.items.map(it => `<li>${it.name || 'Item'} × ${it.qty || 1}</li>`).join('')
+    ? row.items.map(it => `<li>${it.name || 'Item'} × ${it.qty || 1}${it.bogo && it.freeQty ? ` <b>+ ${it.freeQty} FREE (1+1)</b> → ship ${Number(it.qty) + Number(it.freeQty)}` : ''}</li>`).join('')
     : '<li>(no item details)</li>';
   const amountThb = (row.amount / 100).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   const discountThb = row.discount_amount ? (row.discount_amount / 100).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : null;
@@ -505,10 +505,154 @@ async function issueWelcomeCoupons(email) {
 // for a discount, excluding any "TUPS Membership" item's own price. Neither
 // a welcome coupon nor a promo code is allowed to discount a membership
 // purchase itself — only genuine product spend counts.
+//
+// 1+1 (BOGO) items are ALSO excluded: during a 1+1 event the 1+1 product's
+// price never counts toward a coupon's min-spend and never gets discounted
+// by a coupon or promo code. The `bogo` flag on each item is set by the
+// SERVER (normalizeOrderItems() below) when the charge is created, never
+// trusted from the browser — so this stays correct even if the order only
+// gets paid (PromptPay) after the event window has closed.
 function nonMembershipSubtotalSatangFromItems(items) {
   return (Array.isArray(items) ? items : [])
-    .filter(it => !(it && it.membership))
+    .filter(it => !(it && it.membership) && !(it && it.bogo))
     .reduce((sum, it) => sum + (Number(it.price) || 0) * (Number(it.qty) || 0), 0) * 100;
+}
+
+// ------------------------------------------------------------
+// 1+1 EVENT (BOGO) — 11.11 Maxglow Mask
+//
+// During [startsAt, endsAt) every Maxglow Mask in the cart is 1+1: the
+// customer pays for `qty` and receives `qty` more free (freeQty). Outside
+// that window nothing is free, and a cart still claiming a free item is
+// refused (stale tab / tampering).
+//
+// To run another 1+1 later: change the dates / productPattern below and
+// redeploy. Times are Bangkok (+07:00).
+// ------------------------------------------------------------
+const BOGO_EVENT = {
+  key: '1111-maxglow',
+  startsAt: new Date('2026-11-11T11:00:00+07:00').getTime(),
+  endsAt: new Date('2026-11-13T11:00:00+07:00').getTime(), // exclusive → last minute is 10:59
+  productPattern: /max\s*glow/i,                            // matched against the item name
+};
+
+function isBogoEventActive(now = Date.now()) {
+  return now >= BOGO_EVENT.startsAt && now < BOGO_EVENT.endsAt;
+}
+
+function isBogoProduct(item) {
+  return !!item && !item.membership && BOGO_EVENT.productPattern.test(String(item.name || ''));
+}
+
+// Returns a server-trusted copy of the cart: `bogo` / `freeQty` are always
+// (re)computed here, whatever the browser sent.
+function normalizeOrderItems(items, now = Date.now()) {
+  const list = Array.isArray(items) ? items : [];
+  const active = isBogoEventActive(now);
+  const out = [];
+  for (const raw of list) {
+    if (!raw || typeof raw !== 'object') continue;
+    const it = { ...raw };
+    const qty = Number(it.qty) || 0;
+    if (!Number.isInteger(qty) || qty < 0) {
+      return { ok: false, reason: 'invalid_items', message: 'Invalid cart quantity. Please refresh and try again.' };
+    }
+    if (active && isBogoProduct(it)) {
+      it.bogo = true;
+      it.freeQty = qty;                // 1 paid + 1 free, per unit paid
+      it.bogoEvent = BOGO_EVENT.key;
+    } else {
+      if (it.bogo || Number(it.freeQty) > 0) {
+        return {
+          ok: false,
+          reason: 'bogo_ended',
+          message: 'The 1+1 promotion is not active right now. Please refresh your cart and try again.',
+        };
+      }
+      delete it.bogo;
+      delete it.freeQty;
+      delete it.bogoEvent;
+    }
+    out.push(it);
+  }
+  return { ok: true, items: out };
+}
+
+// Pre-charge check for a welcome coupon. Runs BEFORE any Omise charge is
+// created, so a coupon that doesn't legitimately apply (e.g. only 1+1
+// items in the cart) can never be charged at the discounted price.
+async function validateCouponUsage(memberEmail, couponId, discountSatang, items) {
+  const discount = Number(discountSatang) || 0;
+  if (!couponId) {
+    return discount > 0
+      ? { ok: false, reason: 'coupon_invalid', message: 'Discount without a coupon. Please refresh and try again.' }
+      : { ok: true };
+  }
+  const email = String(memberEmail || '').trim().toLowerCase();
+  if (!email) return { ok: false, reason: 'coupon_login', message: 'Coupons can only be used while logged in.' };
+  try {
+    const r = await supabaseRequest(`coupons?id=eq.${encodeURIComponent(couponId)}&select=*`);
+    if (!r.ok) return { ok: false, reason: 'coupon_check_failed', message: 'Could not verify your coupon. Please try again.' };
+    const coupon = (await r.json())[0];
+    if (!coupon || coupon.used || String(coupon.member_email || '').toLowerCase() !== email) {
+      return { ok: false, reason: 'coupon_invalid', message: 'This coupon is not available. Please refresh and try again.' };
+    }
+    const eligibleSatang = nonMembershipSubtotalSatangFromItems(items);
+    if (eligibleSatang < Number(coupon.min_spend) * 100) {
+      const hasBogo = items.some(it => it && it.bogo);
+      return {
+        ok: false,
+        reason: hasBogo ? 'coupon_bogo_excluded' : 'coupon_min_spend',
+        message: hasBogo
+          ? `Coupons can't be used on 1+1 items. Other products in your cart must total at least ฿${Number(coupon.min_spend).toLocaleString()} to use this coupon.`
+          : `Spend at least ฿${Number(coupon.min_spend).toLocaleString()} to use this coupon.`,
+      };
+    }
+    if (discount !== Number(coupon.discount_amount) * 100) {
+      return { ok: false, reason: 'coupon_amount_mismatch', message: 'Coupon amount mismatch. Please refresh and try again.' };
+    }
+    return { ok: true };
+  } catch (err) {
+    console.error('validateCouponUsage error:', err);
+    return { ok: false, reason: 'coupon_check_failed', message: 'Could not verify your coupon. Please try again.' };
+  }
+}
+
+// Pre-charge check for a promo code — same idea as the coupon check.
+async function validatePromoUsage(promoCode, promoDiscountSatang, items) {
+  const claimed = Number(promoDiscountSatang) || 0;
+  const code = String(promoCode || '').trim();
+  if (!code) {
+    return claimed > 0
+      ? { ok: false, reason: 'promo_invalid', message: 'Discount without a promo code. Please refresh and try again.' }
+      : { ok: true };
+  }
+  try {
+    const result = await evaluatePromoCode(code, items);
+    if (!result.ok) return { ok: false, reason: 'promo_invalid', message: result.message };
+    if (claimed !== result.discountSatang) {
+      return { ok: false, reason: 'promo_amount_mismatch', message: 'Promo code amount changed. Please re-apply the code and try again.' };
+    }
+    return { ok: true };
+  } catch (err) {
+    console.error('validatePromoUsage error:', err);
+    return { ok: false, reason: 'promo_check_failed', message: 'Could not verify the promo code. Please try again.' };
+  }
+}
+
+// Everything that must hold before ANY order is created (card, PromptPay,
+// or fully-covered store-credit order). Returns server-normalized items.
+async function preflightOrder(body) {
+  const norm = normalizeOrderItems(body.items);
+  if (!norm.ok) return norm;
+  const items = norm.items;
+  const couponCheck = await validateCouponUsage(body.memberEmail, body.couponId, body.discountSatang, items);
+  if (!couponCheck.ok) return couponCheck;
+  const promoCheck = await validatePromoUsage(body.promoCode, body.promoDiscountSatang, items);
+  if (!promoCheck.ok) return promoCheck;
+  const pointsCheck = await validatePointsUsage(body.memberEmail, body.pointsUsedSatang, items);
+  if (!pointsCheck.ok) return pointsCheck;
+  return { ok: true, items };
 }
 
 async function markCouponUsed(couponId, charge, discountAmount) {
@@ -576,10 +720,10 @@ async function evaluatePromoCode(code, items) {
   }
   const nonMembershipSubtotalSatang = nonMembershipSubtotalSatangFromItems(items);
   if (nonMembershipSubtotalSatang < (Number(promo.min_spend) || 0) * 100) {
-    return { ok: false, message: `Spend at least ฿${Number(promo.min_spend || 0).toLocaleString()} (excluding any membership) to use this code.` };
+    return { ok: false, message: `Spend at least ฿${Number(promo.min_spend || 0).toLocaleString()} to use this code (1+1 items and memberships don't count).` };
   }
   if (nonMembershipSubtotalSatang <= 0) {
-    return { ok: false, message: 'This code can only be used on regular products, not a membership purchase alone.' };
+    return { ok: false, message: 'This code can only be used on regular-price products (not 1+1 items or a membership).' };
   }
   let discountSatang;
   if (promo.discount_type === 'percent') {
@@ -707,7 +851,7 @@ async function validatePointsUsage(memberEmail, pointsUsedSatang, items) {
 // body: { omiseToken, amount, currency, customer: { name, phone, address }, items, returnUri, memberEmail }
 // ------------------------------------------------------------
 app.post('/charge', async (req, res) => {
-  const { omiseToken, amount, currency, customer, items, returnUri, memberEmail, couponId, subtotalSatang, discountSatang, pointsUsedSatang, promoCode, promoDiscountSatang } = req.body;
+  const { omiseToken, amount, currency, customer, returnUri, memberEmail, couponId, subtotalSatang, discountSatang, pointsUsedSatang, promoCode, promoDiscountSatang } = req.body;
 
   if (!omiseToken || !amount || !currency) {
     return res.status(400).json({ success: false, message: 'Missing required fields' });
@@ -718,10 +862,13 @@ app.post('/charge', async (req, res) => {
   // ACTUAL current balance. If the two disagree (balance changed since page
   // load, or the request was tampered with), reject rather than silently
   // charging the lower, unverified amount.
-  const pointsCheck = await validatePointsUsage(memberEmail, pointsUsedSatang, items);
-  if (!pointsCheck.ok) {
-    return res.status(400).json({ success: false, message: pointsCheck.message });
+  // Coupon / promo / store-credit / 1+1 checks, all server-side, BEFORE any
+  // money moves. `items` from here on is the server-normalized cart.
+  const preflight = await preflightOrder(req.body);
+  if (!preflight.ok) {
+    return res.status(400).json({ success: false, reason: preflight.reason, message: preflight.message });
   }
+  const items = preflight.items;
 
   try {
     const charge = await omise.charges.create({
@@ -797,7 +944,7 @@ app.post('/charge', async (req, res) => {
 // response: { success, chargeId, status, qrImageBase64, expiresAt }
 // ------------------------------------------------------------
 app.post('/promptpay-charge', async (req, res) => {
-  const { amount, currency, customer, items, memberEmail, couponId, subtotalSatang, discountSatang, pointsUsedSatang, promoCode, promoDiscountSatang } = req.body;
+  const { amount, currency, customer, memberEmail, couponId, subtotalSatang, discountSatang, pointsUsedSatang, promoCode, promoDiscountSatang } = req.body;
 
   if (!amount || !currency) {
     return res.status(400).json({ success: false, message: 'Missing required fields' });
@@ -808,10 +955,13 @@ app.post('/promptpay-charge', async (req, res) => {
     return res.status(400).json({ success: false, message: 'Invalid amount' });
   }
 
-  const pointsCheck = await validatePointsUsage(memberEmail, pointsUsedSatang, items);
-  if (!pointsCheck.ok) {
-    return res.status(400).json({ success: false, message: pointsCheck.message });
+  // Coupon / promo / store-credit / 1+1 checks, all server-side, BEFORE any
+  // money moves. `items` from here on is the server-normalized cart.
+  const preflight = await preflightOrder(req.body);
+  if (!preflight.ok) {
+    return res.status(400).json({ success: false, reason: preflight.reason, message: preflight.message });
   }
+  const items = preflight.items;
 
   try {
     // 1. Create the PromptPay source for this exact amount.
@@ -904,7 +1054,7 @@ app.post('/promptpay-charge', async (req, res) => {
 //         discountSatang, pointsUsedSatang }
 // ------------------------------------------------------------
 app.post('/zero-amount-order', async (req, res) => {
-  const { customer, items, memberEmail, couponId, subtotalSatang, discountSatang, pointsUsedSatang, promoCode, promoDiscountSatang } = req.body;
+  const { customer, memberEmail, couponId, subtotalSatang, discountSatang, pointsUsedSatang, promoCode, promoDiscountSatang } = req.body;
 
   const subtotal = Number(subtotalSatang) || 0;
   const discount = Number(discountSatang) || 0;
@@ -922,10 +1072,13 @@ app.post('/zero-amount-order', async (req, res) => {
     return res.status(400).json({ success: false, message: 'This order is not fully covered by store credit.' });
   }
 
-  const pointsCheck = await validatePointsUsage(memberEmail, pointsUsed, items);
-  if (!pointsCheck.ok) {
-    return res.status(400).json({ success: false, message: pointsCheck.message });
+  // Coupon / promo / store-credit / 1+1 checks, all server-side, BEFORE any
+  // money moves. `items` from here on is the server-normalized cart.
+  const preflight = await preflightOrder(req.body);
+  if (!preflight.ok) {
+    return res.status(400).json({ success: false, reason: preflight.reason, message: preflight.message });
   }
+  const items = preflight.items;
 
   try {
     const chargeId = 'ptsord_' + crypto.randomBytes(12).toString('hex');
@@ -1017,14 +1170,184 @@ function verifyPassword(password, stored) {
 }
 
 // ------------------------------------------------------------
+// EMAIL VERIFICATION (required before /signup)
+//
+// Flow on signup.html:
+//   1. POST /signup/send-code   { email }        → 6-digit code emailed via Resend
+//   2. POST /signup/verify-code { email, code }  → returns verificationToken
+//   3. POST /signup { ..., verificationToken }   → account created, welcome
+//                                                  coupons issued
+// Without step 2, /signup refuses — so every member (and every welcome
+// coupon) is tied to an inbox the person actually controls.
+//
+// Stored in Supabase table `email_verifications` (see
+// sql/2026-11-email-verification.sql). Only a SHA-256 hash of the code is
+// stored, never the code itself.
+// ------------------------------------------------------------
+const EMAIL_CODE_TTL_MS = 10 * 60 * 1000;            // code valid 10 minutes
+const EMAIL_CODE_RESEND_COOLDOWN_MS = 60 * 1000;     // 1 resend per 60s
+const EMAIL_CODE_MAX_ATTEMPTS = 5;                   // wrong guesses before a new code is needed
+const EMAIL_VERIFIED_TOKEN_TTL_MS = 30 * 60 * 1000;  // finish the form within 30 min of verifying
+const EMAIL_RULE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+
+function hashEmailCode(email, code) {
+  return crypto.createHash('sha256').update(`${email}|${code}|${SUPABASE_SERVICE_KEY || ''}`).digest('hex');
+}
+
+async function getEmailVerification(email) {
+  const r = await supabaseRequest(`email_verifications?email=eq.${encodeURIComponent(email)}&select=*`);
+  if (!r.ok) throw new Error(`email_verifications lookup failed: ${r.status} ${await r.text()}`);
+  const rows = await r.json();
+  return rows[0] || null;
+}
+
+app.post('/signup/send-code', async (req, res) => {
+  const email = String(req.body?.email || '').trim().toLowerCase();
+  if (!EMAIL_RULE.test(email)) {
+    return res.status(400).json({ success: false, reason: 'invalid_email', message: 'Please enter a valid email address.' });
+  }
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
+    return res.status(500).json({ success: false, message: 'Database is not configured yet' });
+  }
+  if (!RESEND_API_KEY) {
+    // Unlike forgot-password, this MUST fail loudly — otherwise nobody can sign up and nobody knows why.
+    console.error('RESEND_API_KEY not set — cannot send signup verification codes');
+    return res.status(500).json({ success: false, message: 'Email service is not configured. Please contact us.' });
+  }
+  try {
+    // Already a member? Tell them now, before they wait for a code.
+    const memRes = await supabaseRequest(`members?email=eq.${encodeURIComponent(email)}&select=id`);
+    if (memRes.ok && (await memRes.json()).length > 0) {
+      return res.status(409).json({ success: false, reason: 'email_exists', message: 'This email is already registered' });
+    }
+
+    const existing = await getEmailVerification(email);
+    if (existing?.last_sent_at && Date.now() - new Date(existing.last_sent_at).getTime() < EMAIL_CODE_RESEND_COOLDOWN_MS) {
+      const waitSec = Math.ceil((EMAIL_CODE_RESEND_COOLDOWN_MS - (Date.now() - new Date(existing.last_sent_at).getTime())) / 1000);
+      return res.status(429).json({ success: false, reason: 'cooldown', waitSeconds: waitSec, message: `Please wait ${waitSec}s before requesting a new code.` });
+    }
+
+    const code = String(crypto.randomInt(0, 1000000)).padStart(6, '0');
+    const now = new Date();
+    const upsertRes = await supabaseRequest('email_verifications?on_conflict=email', {
+      method: 'POST',
+      headers: { Prefer: 'resolution=merge-duplicates,return=minimal' },
+      body: JSON.stringify({
+        email,
+        code_hash: hashEmailCode(email, code),
+        expires_at: new Date(now.getTime() + EMAIL_CODE_TTL_MS).toISOString(),
+        attempts: 0,
+        last_sent_at: now.toISOString(),
+        verified_token: null,
+        verified_at: null,
+      }),
+    });
+    if (!upsertRes.ok) {
+      console.error('email_verifications upsert failed:', upsertRes.status, await upsertRes.text());
+      return res.status(500).json({ success: false, message: 'Server error. Please try again.' });
+    }
+
+    const r = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${RESEND_API_KEY}` },
+      body: JSON.stringify({
+        from: RESEND_FROM_EMAIL,
+        to: [email],
+        subject: `${code} — รหัสยืนยันอีเมล / Email verification code · TUPS Thailand`,
+        html: `
+          <div style="font-family:sans-serif; max-width:480px; margin:0 auto; color:#111;">
+            <p>รหัสยืนยันอีเมลสำหรับสมัครสมาชิก TUPS Thailand ของคุณคือ</p>
+            <p>Your TUPS Thailand sign-up verification code is</p>
+            <p style="font-size:34px; letter-spacing:8px; font-weight:700; margin:24px 0;">${code}</p>
+            <p style="color:#6B6B6B; font-size:13px;">รหัสนี้ใช้ได้ 10 นาที · This code expires in 10 minutes.</p>
+            <p style="color:#6B6B6B; font-size:13px;">หากคุณไม่ได้สมัครสมาชิก กรุณาเพิกเฉยอีเมลนี้ · If you didn't request this, you can ignore this email.</p>
+          </div>`,
+      }),
+    });
+    if (!r.ok) {
+      console.error('Resend verification email failed:', r.status, await r.text());
+      return res.status(502).json({ success: false, message: 'Could not send the verification email. Please check the address and try again.' });
+    }
+    return res.json({ success: true, expiresInSeconds: EMAIL_CODE_TTL_MS / 1000, resendAfterSeconds: EMAIL_CODE_RESEND_COOLDOWN_MS / 1000 });
+  } catch (err) {
+    console.error('send-code error:', err);
+    return res.status(500).json({ success: false, message: 'Server error. Please try again.' });
+  }
+});
+
+app.post('/signup/verify-code', async (req, res) => {
+  const email = String(req.body?.email || '').trim().toLowerCase();
+  const code = String(req.body?.code || '').trim();
+  if (!email || !/^\d{6}$/.test(code)) {
+    return res.status(400).json({ success: false, reason: 'invalid_code', message: 'Please enter the 6-digit code.' });
+  }
+  try {
+    const row = await getEmailVerification(email);
+    if (!row || !row.code_hash) {
+      return res.status(400).json({ success: false, reason: 'no_code', message: 'Please request a verification code first.' });
+    }
+    if (new Date(row.expires_at).getTime() < Date.now()) {
+      return res.status(400).json({ success: false, reason: 'expired', message: 'This code has expired. Please request a new one.' });
+    }
+    if ((row.attempts || 0) >= EMAIL_CODE_MAX_ATTEMPTS) {
+      return res.status(429).json({ success: false, reason: 'too_many_attempts', message: 'Too many wrong attempts. Please request a new code.' });
+    }
+    const ok = crypto.timingSafeEqual(Buffer.from(row.code_hash, 'hex'), Buffer.from(hashEmailCode(email, code), 'hex'));
+    if (!ok) {
+      const left = EMAIL_CODE_MAX_ATTEMPTS - (row.attempts || 0) - 1;
+      await supabaseRequest(`email_verifications?email=eq.${encodeURIComponent(email)}`, {
+        method: 'PATCH',
+        headers: { Prefer: 'return=minimal' },
+        body: JSON.stringify({ attempts: (row.attempts || 0) + 1 }),
+      });
+      return res.status(400).json({ success: false, reason: 'wrong_code', attemptsLeft: Math.max(0, left), message: 'Incorrect code.' });
+    }
+    const verificationToken = crypto.randomBytes(24).toString('hex');
+    const patchRes = await supabaseRequest(`email_verifications?email=eq.${encodeURIComponent(email)}`, {
+      method: 'PATCH',
+      headers: { Prefer: 'return=minimal' },
+      // code_hash cleared so the same code can't be replayed
+      body: JSON.stringify({ code_hash: null, verified_token: verificationToken, verified_at: new Date().toISOString() }),
+    });
+    if (!patchRes.ok) {
+      console.error('verify-code patch failed:', patchRes.status, await patchRes.text());
+      return res.status(500).json({ success: false, message: 'Server error. Please try again.' });
+    }
+    return res.json({ success: true, verificationToken });
+  } catch (err) {
+    console.error('verify-code error:', err);
+    return res.status(500).json({ success: false, message: 'Server error. Please try again.' });
+  }
+});
+
+// Thai mobile: 10 digits starting 06/08/09 (spaces/dashes ignored), or +66 form.
+function normalizeThaiPhone(raw) {
+  let p = String(raw || '').replace(/[\s\-().]/g, '');
+  if (p.startsWith('+66')) p = '0' + p.slice(3);
+  else if (p.startsWith('66') && p.length === 11) p = '0' + p.slice(2);
+  return /^0[689]\d{8}$/.test(p) ? p : null;
+}
+
+// ------------------------------------------------------------
 // POST /signup
-// body: { email, password, name, phone }
+// body: { email, password, name, phone, verificationToken }
 // ------------------------------------------------------------
 app.post('/signup', async (req, res) => {
-  const { email, password, name, phone } = req.body;
+  const { email, password, name, verificationToken } = req.body;
+  let { phone } = req.body;
 
   if (!email || !password) {
     return res.status(400).json({ success: false, message: 'Email and password are required' });
+  }
+  if (!String(name || '').trim()) {
+    return res.status(400).json({ success: false, reason: 'name_required', message: 'Please enter your name.' });
+  }
+  phone = normalizeThaiPhone(phone);
+  if (!phone) {
+    return res.status(400).json({ success: false, reason: 'invalid_phone', message: 'Please enter a valid Thai mobile number (e.g. 0812345678).' });
+  }
+  if (!verificationToken) {
+    return res.status(400).json({ success: false, reason: 'email_not_verified', message: 'Please verify your email address first.' });
   }
   if (!PASSWORD_RULE.test(password)) {
     return res.status(400).json({
@@ -1034,6 +1357,21 @@ app.post('/signup', async (req, res) => {
   }
   if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
     return res.status(500).json({ success: false, message: 'Database is not configured yet' });
+  }
+
+  const normalizedEmailForVerify = String(email).trim().toLowerCase();
+  try {
+    const ver = await getEmailVerification(normalizedEmailForVerify);
+    const tokenOk = ver && ver.verified_token && ver.verified_at
+      && ver.verified_token.length === String(verificationToken).length
+      && crypto.timingSafeEqual(Buffer.from(ver.verified_token), Buffer.from(String(verificationToken)))
+      && Date.now() - new Date(ver.verified_at).getTime() < EMAIL_VERIFIED_TOKEN_TTL_MS;
+    if (!tokenOk) {
+      return res.status(400).json({ success: false, reason: 'email_not_verified', message: 'Email verification expired or invalid. Please verify your email again.' });
+    }
+  } catch (err) {
+    console.error('Signup verification check error:', err);
+    return res.status(500).json({ success: false, message: 'Server error while creating account' });
   }
 
   try {
@@ -1061,8 +1399,10 @@ app.post('/signup', async (req, res) => {
     const row = {
       email: String(email).trim().toLowerCase(),
       password_hash: hashPassword(password),
-      name: name || '',
-      phone: phone || '',
+      name: String(name).trim(),
+      phone,
+      email_verified: true,
+      email_verified_at: new Date().toISOString(),
     };
     const sbRes = await supabaseRequest('members', {
       method: 'POST',
@@ -1071,6 +1411,10 @@ app.post('/signup', async (req, res) => {
     });
 
     if (sbRes.ok) {
+      // One verification = one account: burn it so it can't be reused.
+      supabaseRequest(`email_verifications?email=eq.${encodeURIComponent(row.email)}`, {
+        method: 'DELETE', headers: { Prefer: 'return=minimal' },
+      }).catch(e => console.error('email_verifications cleanup error:', e));
       // Fire-and-forget — a hiccup issuing coupons shouldn't fail the signup
       // itself, since the account was already created successfully above.
       issueWelcomeCoupons(row.email);
@@ -1364,7 +1708,9 @@ app.post('/validate-promo-code', async (req, res) => {
     return res.status(500).json({ success: false, message: 'Database is not configured yet' });
   }
   try {
-    const result = await evaluatePromoCode(code, items);
+    const norm = normalizeOrderItems(items);
+    if (!norm.ok) return res.json({ success: false, reason: norm.reason, message: norm.message });
+    const result = await evaluatePromoCode(code, norm.items);
     if (!result.ok) {
       return res.json({ success: false, message: result.message });
     }
@@ -1679,7 +2025,7 @@ app.get('/admin/members', async (req, res) => {
   if (!requireAdminKey(req, res)) return;
   try {
     // Never select password_hash here.
-    const sbRes = await supabaseRequest('members?select=id,email,name,phone,created_at&order=created_at.desc&limit=1000');
+    const sbRes = await supabaseRequest('members?select=id,email,name,phone,email_verified,created_at&order=created_at.desc&limit=1000');
     if (!sbRes.ok) {
       console.error('Admin members fetch failed:', sbRes.status, await sbRes.text());
       return res.status(500).json({ success: false, message: 'Server error' });
@@ -1811,6 +2157,22 @@ app.delete('/admin/promo-codes/:id', async (req, res) => {
     console.error('Admin promo-code delete error:', err);
     return res.status(500).json({ success: false, message: 'Server error' });
   }
+});
+
+// Public: lets the site show/hide the 1+1 banner by SERVER time (a
+// customer's phone clock can be wrong).
+app.get('/promo/active', (req, res) => {
+  res.json({
+    success: true,
+    serverTime: new Date().toISOString(),
+    bogo: {
+      key: BOGO_EVENT.key,
+      active: isBogoEventActive(),
+      startsAt: new Date(BOGO_EVENT.startsAt).toISOString(),
+      endsAt: new Date(BOGO_EVENT.endsAt).toISOString(),
+      couponsAllowedOnBogoItems: false,
+    },
+  });
 });
 
 app.get('/', (req, res) => res.send('LYVON TUPS payment server is running.'));
